@@ -77,8 +77,36 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   call taking `&mut impl Oracle`.
 - `session::fixtures::World` takes its `time_control` (default
   `["300", "3"]`): a short bank for a runtime's tests.
+- **`query`** — a query the relay's EOSE proves: the notifications
+  subscribed before the `REQ` is sent to the relay itself, the events
+  collected (signatures verified, duplicates dropped) until the `EOSE` —
+  or a `CLOSED` without a machine-readable prefix — for that subscription;
+  a shutdown, an error `CLOSED` or the bound answer `None`. What the
+  Publisher's `resolve` and a bot's reads at start rest on.
+- `drafts::Replacing<D>` — a replaceable draft stamped after the relay's
+  copy (`not_before = copy_at + 1`), so that the new event replaces a copy
+  written by hand ahead of the relay's clock.
+- `Publisher::open_leased` — `open` with a lease the caller took earlier
+  (a bot takes it before its engine probe, ADR-0045 §7).
+- `futures-util` is a plain dependency (the query's stream), no longer
+  `testing`'s only.
+- `Publisher::signed(id)` — whether this publisher signed the event (the
+  newest 65,536 ids, resends and re-signings included): what a bot's echo
+  detector asks. `Publisher::signer()` — the signer, for what it derives
+  besides signatures (a bot's open seat and jitter), never its key.
+- **`clock::check`** — the clock check of a bot's start (ADR-0045 §7,
+  step 4): the module's `clock` primitive accepts exactly `max_affordable`
+  and flags one second past it, on the boundary cases the unit test
+  pinned; `ClockMismatch` names the case.
 
 ### Fixed
+
+- **A disconnection mid-query was read as an answer.** `nostr-sdk` 0.45's
+  `Relay::fetch_events` ends its stream silently when the relay
+  disconnects while a `REQ` is open, and returns the events received so
+  far as if the relay had said `EOSE`; `Publisher::resolve` read that as
+  `ConfirmedAbsent`, and an `EarliestWins` draft could be signed twice.
+  `resolve` now rests on `query`, which requires the `EOSE`.
 
 - **A relay's rejection was read as an acceptance.** Since `nostr-sdk` 0.41,
   `Client::send_event` answers `Ok` whether or not any relay accepted the

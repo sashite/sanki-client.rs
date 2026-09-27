@@ -590,6 +590,53 @@ impl Publishable for MuteList {
     }
 }
 
+/// A replaceable draft stamped after the relay's copy: `not_before` is the
+/// copy's `created_at` plus one, so that the new event replaces it under
+/// NIP-01's rule whatever the copy's stamp (a copy written by hand may be
+/// ahead of the relay's clock, within its future tolerance).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Replacing<D> {
+    /// The draft.
+    pub draft: D,
+    /// The relay copy's `created_at`.
+    pub copy_at: u64,
+}
+
+impl<D> sealed::Sealed for Replacing<D> {}
+
+impl<D: Publishable> Publishable for Replacing<D> {
+    fn name(&self) -> &'static str {
+        self.draft.name()
+    }
+    fn kind(&self) -> Kind {
+        self.draft.kind()
+    }
+    fn window(&self) -> Window {
+        let inner = self.draft.window();
+        Window {
+            not_before: Some(
+                inner
+                    .not_before
+                    .unwrap_or(0)
+                    .max(self.copy_at.saturating_add(1)),
+            ),
+            not_after: inner.not_after,
+        }
+    }
+    fn mined(&self) -> bool {
+        self.draft.mined()
+    }
+    fn convergence(&self) -> Convergence {
+        self.draft.convergence()
+    }
+    fn may_take_reserve(&self) -> bool {
+        self.draft.may_take_reserve()
+    }
+    fn at(&self, stamp: u64, relay: &str) -> Result<Parts, Withheld> {
+        self.draft.at(stamp, relay)
+    }
+}
+
 /// A policy to publish (kind `30420`): the mode, with what it requires.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Policy {
@@ -781,6 +828,20 @@ mod tests {
         assert!(content.contains(r#""bot":true"#));
         assert_eq!(profile.kind(), Kind::Metadata);
         assert_eq!(profile.window(), Window::default());
+    }
+
+    #[test]
+    fn replacing_stamps_after_the_copy() {
+        let replacing = Replacing {
+            draft: MuteList(vec![]),
+            copy_at: 1_000,
+        };
+        assert_eq!(replacing.window().not_before, Some(1_001));
+        assert_eq!(replacing.window().not_after, None);
+        assert_eq!(replacing.kind(), Kind::Custom(KIND_MUTE_LIST));
+        assert_eq!(replacing.convergence(), Convergence::Replaceable);
+        assert!(!replacing.may_take_reserve());
+        assert!(replacing.at(1_001, "").unwrap().tags.is_empty());
     }
 
     #[test]

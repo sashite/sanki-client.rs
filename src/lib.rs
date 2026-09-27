@@ -15,6 +15,7 @@
 //! | [`readers`] | typed readers of the suite's kinds (`3420`, `3422`, `3426`, `30420`, `0`, `3`, `10000`): the event, or the reason it does not conform |
 //! | [`drafts`] | the sealed drafts: a Ply, a Game Session, a Conclusion, a Direct Challenge, the standing events — each with its window, its proof of work and its convergence |
 //! | [`publisher`] | one queue ordered by deadline, the token governor with its reserve, stamping without backdating, the outcomes and what each convergence does with `Unknown`, the lease |
+//! | [`query`] | a query the relay's EOSE proves: `Some(events)`, or `None` when nothing is proven |
 //! | [`relay`] | the relay's NIP-11 document, read as a self-timed client must |
 //! | [`publish`] | the primitives: the relay clock estimate, NIP-13 mining, `publish_self_timed` for a caller without the Publisher |
 //! | [`tags`] | readers of the suite's tag conventions (roles, markers, rows) |
@@ -39,6 +40,7 @@ pub mod module;
 pub mod notation;
 pub mod publish;
 pub mod publisher;
+pub mod query;
 pub mod readers;
 pub mod relay;
 pub mod rules;

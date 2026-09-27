@@ -16,7 +16,7 @@ default = []
 # The in-process NIP-01 relay (`testing::MiniRelay`), the reference module's
 # native face as an `Oracle` (`module::native::Native`) and the signed suite
 # events of `session::fixtures` — what a bot's own tests drive the client with.
-testing = ["dep:sashite-sanki-kernel-wasm", "dep:tokio-tungstenite", "dep:futures-util"]
+testing = ["dep:sashite-sanki-kernel-wasm", "dep:tokio-tungstenite"]
 
 [dependencies]
 # Networking client; bundles `nostr` 0.45 (Event, EventBuilder, Tag, Kind, Keys, …).
@@ -47,7 +47,9 @@ sashite-sanki-engine = "0.12"
 # `testing` only.
 sashite-sanki-kernel-wasm = { version = "0.1", optional = true }
 tokio-tungstenite = { version = "0.26", optional = true }
-futures-util = { version = "0.3", optional = true }
+# The notification stream of a proven query (`query`); `testing` too. In the
+# dependency tree already, via nostr-sdk.
+futures-util = "0.3"
 
 [dev-dependencies]
 sashite-sanki-client = { path = ".", features = ["testing"] }

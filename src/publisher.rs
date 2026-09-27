@@ -73,6 +73,10 @@ const OK_TIMEOUT: Duration = Duration::from_secs(1);
 /// How long a `resolve` query may take.
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How many signed ids are remembered: days of a bot's events at the
+/// relay's rate.
+const SIGNED_KEPT: usize = 65_536;
+
 /// The largest mining time the open accepts, at the worst of twenty.
 const MINING_BOUND: Duration = Duration::from_secs(1);
 
@@ -459,6 +463,9 @@ struct Inner<S> {
     /// that the stamp is monotone there and a second write within the same
     /// second is not lost to the lower id.
     last_replaceable: Mutex<std::collections::HashMap<(u16, String), u64>>,
+    /// Every id this publisher signed, the newest `SIGNED_KEPT` of them:
+    /// what an echo detector asks.
+    signed: Mutex<(VecDeque<EventId>, std::collections::HashSet<EventId>)>,
 }
 
 /// The publisher: one queue, one writer.
@@ -495,6 +502,29 @@ where
             .get_public_key()
             .map_err(|_| OpenError::Unreachable)?;
         let lease = Lease::take(&settings.data_dir, pubkey)?;
+        Self::open_leased(client, signer, settings, lease).await
+    }
+
+    /// [`Self::open`] with a lease the caller took earlier — a bot takes it
+    /// before its engine probe, so that a second instance fails before any
+    /// work (ADR-0045 §7). The lease must be the signer's.
+    ///
+    /// # Errors
+    ///
+    /// See [`OpenError`]; [`OpenError::KeyInUse`] when `lease` is another
+    /// key's.
+    pub async fn open_leased(
+        client: Client,
+        signer: S,
+        settings: Settings,
+        lease: Lease,
+    ) -> Result<Self, OpenError> {
+        let pubkey = signer
+            .get_public_key()
+            .map_err(|_| OpenError::Unreachable)?;
+        if lease.pubkey != pubkey {
+            return Err(OpenError::KeyInUse(lease.path.clone()));
+        }
 
         // The round trip: a REQ answered by EOSE, on the relay itself (the
         // pool's fetch ends silently on a timeout; the relay's propagates
@@ -553,6 +583,7 @@ where
             closed: AtomicBool::new(false),
             http: reqwest::Client::new(),
             last_replaceable: Mutex::new(std::collections::HashMap::new()),
+            signed: Mutex::new((VecDeque::new(), std::collections::HashSet::new())),
         });
         tokio::spawn(dispatch(Arc::clone(&inner)));
         Ok(Self { inner })
@@ -562,6 +593,27 @@ where
     #[must_use]
     pub fn public_key(&self) -> Option<PublicKey> {
         self.inner.signer.get_public_key().ok()
+    }
+
+    /// The signer, for what it derives besides signatures (a bot's open
+    /// seat and jitter, ADR-0045 §2); never its key.
+    #[must_use]
+    pub fn signer(&self) -> &S {
+        &self.inner.signer
+    }
+
+    /// Whether this publisher signed `id` — every event it ever sent, a
+    /// resend, a re-stamp or a re-signing included (the newest
+    /// `SIGNED_KEPT`): what an echo detector asks of an event signed with
+    /// the bot's key.
+    #[must_use]
+    pub fn signed(&self, id: &EventId) -> bool {
+        self.inner
+            .signed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .1
+            .contains(id)
     }
 
     /// The relay's clock now, in seconds, as estimated.
@@ -627,20 +679,17 @@ impl<S> Drop for Publisher<S> {
     }
 }
 
-/// Fetches `id` from the relay itself, under a timeout of this crate's:
-/// `None` when the relay did not answer (a timeout, a disconnection), so
-/// that silence is never read as absence.
+/// Fetches `id` from the relay itself, proven by its EOSE
+/// ([`crate::query::query`]): `None` when the relay did not answer, so that
+/// silence is never read as absence.
 async fn fetch_by_id(client: &Client, relay: &RelayUrl, id: EventId) -> Option<Vec<Event>> {
-    let relay = client.relay(relay).await.ok()??;
-    let fetched = tokio::time::timeout(
+    crate::query::query(
+        client,
+        relay,
+        vec![Filter::new().id(id).limit(1)],
         RESOLVE_TIMEOUT,
-        relay.fetch_events(vec![Filter::new().id(id).limit(1)]),
     )
-    .await;
-    match fetched {
-        Ok(Ok(events)) => Some(events.into_iter().collect()),
-        _ => None,
-    }
+    .await
 }
 
 /// Mines twenty throwaway events at `difficulty`; the worst time.
@@ -770,9 +819,28 @@ where
             .unwrap_or_else(|e| Err(SignFailure::Failed(format!("mining task: {e}"))))?,
             _ => unsigned,
         };
-        self.signer
+        let event = self
+            .signer
             .sign_event(unsigned)
-            .map_err(|e| SignFailure::Failed(format!("signing: {e}")))
+            .map_err(|e| SignFailure::Failed(format!("signing: {e}")))?;
+        self.remember(event.id);
+        Ok(event)
+    }
+
+    /// Records an id this publisher signed.
+    fn remember(&self, id: EventId) {
+        let mut signed = self
+            .signed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if signed.1.insert(id) {
+            signed.0.push_back(id);
+            while signed.0.len() > SIGNED_KEPT {
+                if let Some(old) = signed.0.pop_front() {
+                    signed.1.remove(&old);
+                }
+            }
+        }
     }
 
     /// Sends a signed event; the relay's answer.
