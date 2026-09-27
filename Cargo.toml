@@ -1,0 +1,63 @@
+[package]
+name = "sashite-sanki-client"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.96"
+license = "Apache-2.0"
+repository = "https://github.com/sashite/sanki-client.rs"
+description = "The Sanki protocol client for bots (ADR-0045 §1): the Rule System of kind 3417 loaded, verified and run under wasmi as the only rules oracle; the relay's NIP-11 information; the session assembled for the module and read through natural_state, verdict_at, check and select_conclusion; the Ply content ↔ canonical PMN converters; self-timed publishing with NIP-13 mining; an in-process relay for tests. No policy, no autonomy."
+keywords = ["sashite", "sanki", "nostr", "chess", "shogi"]
+categories = ["games", "network-programming"]
+readme = "README.md"
+exclude = ["/.github", "/deny.toml"]
+
+[features]
+default = []
+# The in-process NIP-01 relay (`testing::MiniRelay`), the reference module's
+# native face as an `Oracle` (`module::native::Native`) and the signed suite
+# events of `session::fixtures` — what a bot's own tests drive the client with.
+testing = ["dep:sashite-sanki-kernel-wasm", "dep:tokio-tungstenite", "dep:futures-util"]
+
+[dependencies]
+# Networking client; bundles `nostr` 0.45 (Event, EventBuilder, Tag, Kind, Keys, …).
+nostr-sdk = "0.45"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+anyhow = "1"
+tracing = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# The rule system (ADR-0034): the kind-3417 Rule System parser (`nostchmaker`);
+# the WebAssembly interpreter the session's module runs under (pure Rust,
+# deterministic, no JIT — the runtime the module's own conformance run uses);
+# the module's digest check; fetching the module's bytes from the event's
+# `url` hints and the relay's NIP-11 document (rustls, like the relay connection).
+nostchmaker = "0.9"
+wasmi = { version = "2", features = ["deterministic"] }
+sha2 = "0.10"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+
+# The oracle of NOTATION only (SEI Rules Document — Sanki): the Ply content ↔
+# canonical PMN converters of its `pmn` module. Legality stays the module's.
+sashite-sanki-engine = "0.12"
+
+# `testing` only.
+sashite-sanki-kernel-wasm = { version = "0.1", optional = true }
+tokio-tungstenite = { version = "0.26", optional = true }
+futures-util = { version = "0.3", optional = true }
+
+[dev-dependencies]
+sashite-sanki-client = { path = ".", features = ["testing"] }
+# Hand-written modules of the wrong shape, for the runtime's refusal tests.
+wat = "1"
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
