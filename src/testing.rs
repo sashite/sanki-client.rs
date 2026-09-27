@@ -14,7 +14,10 @@
 //!   a client's stamping and skew correction are tested against the contract
 //!   the production relay implements (`sashite-nostr-relay-timing-policy`);
 //! - `set_min_pow` requires the NIP-13 `nonce` tag on the kinds that
-//!   prescribe it, mined to a minimum.
+//!   prescribe it, mined to a minimum;
+//! - `set_rate_limit` enforces the per-signer rate limit, with its wording;
+//! - `set_drop_acks` stores the next events without acknowledging them;
+//! - `set_silent` answers no REQ, so that a query proves nothing.
 //!
 //! Filter support is the subset a client uses: `ids`, `authors`, `kinds`,
 //! `#e` / `#p` (any single-letter tag), `since`, `until`. `limit` is ignored
@@ -95,6 +98,14 @@ pub struct RelayState {
     /// simulate skew.
     skew: Mutex<i64>,
     min_pow: Mutex<u8>,
+    /// The per-signer rate limit: at most `.0` events per `.1` seconds.
+    rate_limit: Mutex<Option<(u32, u64)>>,
+    /// Accepted events per signer, as `(instant, pubkey)`.
+    accepted: Mutex<Vec<(Instant, String)>>,
+    /// How many of the next EVENT frames are stored but not acknowledged.
+    drop_acks: Mutex<u32>,
+    /// Ignore every REQ: no events, no EOSE — a relay that does not answer.
+    silent: Mutex<bool>,
     subscriptions: Mutex<Vec<Subscription>>,
 }
 
@@ -150,6 +161,23 @@ impl MiniRelay {
     /// leading zero bits; `0` requires nothing.
     pub async fn set_min_pow(&self, min: u8) {
         *self.state.min_pow.lock().await = min;
+    }
+
+    /// Enforce the reference relay's per-signer rate limit: at most `max`
+    /// accepted events per `window_secs` — or stop.
+    pub async fn set_rate_limit(&self, limit: Option<(u32, u64)>) {
+        *self.state.rate_limit.lock().await = limit;
+    }
+
+    /// Store the next `count` events without acknowledging them: the
+    /// publisher never learns whether the relay took them.
+    pub async fn set_drop_acks(&self, count: u32) {
+        *self.state.drop_acks.lock().await = count;
+    }
+
+    /// Answer no REQ at all — neither events nor EOSE — or stop.
+    pub async fn set_silent(&self, silent: bool) {
+        *self.state.silent.lock().await = silent;
     }
 
     /// The NIP-11 document this relay would advertise for its current
@@ -233,6 +261,9 @@ async fn handle_connection(stream: TcpStream, state: Arc<RelayState>) {
                 }
             }
             Some("REQ") => {
+                if *state.silent.lock().await {
+                    continue;
+                }
                 let Some(sub_id) = items.get(1).and_then(Value::as_str) else {
                     continue;
                 };
@@ -317,6 +348,28 @@ async fn handle_publish(state: &Arc<RelayState>, event: Value, outbound: &Unboun
             .await
             .as_deref()
             .is_some_and(|target| target == pubkey);
+    // A duplicate is acknowledged as such, and stored again by no one.
+    let duplicate = state
+        .stored
+        .lock()
+        .await
+        .iter()
+        .any(|stored| stored.get("id").and_then(Value::as_str) == Some(id.as_str()));
+    if duplicate {
+        let _ = outbound.send(json!(["OK", id, true, "duplicate: have this event"]).to_string());
+        return;
+    }
+    {
+        let mut drop = state.drop_acks.lock().await;
+        if *drop > 0 {
+            *drop -= 1;
+            if !swallowed {
+                store_and_broadcast(state, event).await;
+            }
+            return;
+        }
+    }
+    state.accepted.lock().await.push((Instant::now(), pubkey));
     let _ = outbound.send(json!(["OK", id, true, ""]).to_string());
     if !swallowed {
         store_and_broadcast(state, event).await;
@@ -346,6 +399,25 @@ async fn rejection(state: &Arc<RelayState>, event: &Value, kind: u64) -> Option<
                     window.future
                 ));
             }
+        }
+    }
+    if let Some((max, window_secs)) = *state.rate_limit.lock().await {
+        let pubkey = event.get("pubkey").and_then(Value::as_str).unwrap_or("");
+        let now = Instant::now();
+        let recent = state
+            .accepted
+            .lock()
+            .await
+            .iter()
+            .filter(|(at, signer)| {
+                signer == pubkey
+                    && now.duration_since(*at) < std::time::Duration::from_secs(window_secs)
+            })
+            .count();
+        if recent >= max as usize {
+            return Some(format!(
+                "rate-limited: over {max} events per {window_secs}s from this signer"
+            ));
         }
     }
     let min = *state.min_pow.lock().await;

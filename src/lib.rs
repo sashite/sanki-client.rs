@@ -12,8 +12,11 @@
 //! | [`notation`] | the Ply content ↔ canonical PMN converters, on `sashite_sanki_engine::pmn` (the oracle of notation only) |
 //! | [`clock`] | how many seconds a mover may still take (`max_affordable`) |
 //! | [`cadence`] | the cadence family of a time control (*Cadence — Sanki*) |
+//! | [`readers`] | typed readers of the suite's kinds (`3420`, `3422`, `3426`, `30420`, `0`, `3`, `10000`): the event, or the reason it does not conform |
+//! | [`drafts`] | the sealed drafts: a Ply, a Game Session, a Conclusion, a Direct Challenge, the standing events — each with its window, its proof of work and its convergence |
+//! | [`publisher`] | one queue ordered by deadline, the token governor with its reserve, stamping without backdating, the outcomes and what each convergence does with `Unknown`, the lease |
 //! | [`relay`] | the relay's NIP-11 document, read as a self-timed client must |
-//! | [`publish`] | self-timed stamping against the relay's estimated clock, NIP-13 mining, stale and future rejections |
+//! | [`publish`] | the primitives: the relay clock estimate, NIP-13 mining, `publish_self_timed` for a caller without the Publisher |
 //! | [`tags`] | readers of the suite's tag conventions (roles, markers, rows) |
 //! | [`testing`] | an in-process NIP-01 relay with the strict window and the proof of work switchable (`testing` feature) |
 //!
@@ -25,17 +28,18 @@
 //!
 //! **What this crate is not.** It sends no challenge, founds no session, plays
 //! no move and claims no verdict on its own; it holds no key beyond the
-//! signing a caller asks for; it has no configuration. The `Publisher` of
-//! ADR-0045 §6 — one queue, the token governor, the sealed drafts and their
-//! convergence — comes with the bot's SEI refactor; until then a caller
-//! stamps, mines and sends with [`publish::publish_self_timed`].
+//! signing a caller asks for (a signer the caller moves into the
+//! [`publisher::Publisher`]); it has no configuration.
 
 pub mod cadence;
 pub mod chain;
 pub mod clock;
+pub mod drafts;
 pub mod module;
 pub mod notation;
 pub mod publish;
+pub mod publisher;
+pub mod readers;
 pub mod relay;
 pub mod rules;
 pub mod session;

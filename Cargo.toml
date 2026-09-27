@@ -35,6 +35,9 @@ serde_json = "1"
 nostchmaker = "0.9"
 wasmi = { version = "2", features = ["deterministic"] }
 sha2 = "0.10"
+# The lease of a key on the host (`publisher::Lease`): an advisory file lock
+# through a safe wrapper.
+nix = { version = "0.30", features = ["fs"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
 # The oracle of NOTATION only (SEI Rules Document — Sanki): the Ply content ↔

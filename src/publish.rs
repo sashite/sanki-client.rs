@@ -65,7 +65,7 @@ impl RelayClock {
     }
 
     /// Raise the estimate after a stale rejection.
-    fn bump(&self) {
+    pub(crate) fn bump(&self) {
         let _ = self
             .skew_secs
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |skew| {
@@ -74,7 +74,7 @@ impl RelayClock {
     }
 
     /// Lower the estimate after a too-far-future rejection.
-    fn lower(&self) {
+    pub(crate) fn lower(&self) {
         let _ = self
             .skew_secs
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |skew| {

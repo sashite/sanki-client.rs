@@ -33,6 +33,44 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   switchable; the reference module's native face as an `Oracle`
   (`module::native::Native`) and the signed suite events of
   `session::fixtures`, so a bot's tests drive the client without a `.wasm`.
+- **`readers`** — typed readers of the suite's kinds (ADR-0045 §1): the
+  Direct Challenge (`3420`, constraints 1–9 and the structural part of 10
+  and 11), the founding reference of a Game Session (`3422`), the Elo
+  Rating Attestation (`3426`), the Challenge Policy (`30420`), the profile
+  (`0`, with its `bot` flag), the contact list (`3`), the mute list
+  (`10000`), and `has_client_tag` for the NIP-89 tag. A reader returns the
+  event typed, or a `NonConforming` naming the constraint it fails.
+- **`drafts`** — the **sealed** `Publishable` trait and the drafts: a Ply,
+  a Game Session, a Conclusion (with `still(stamp)`, `Moot` otherwise), an
+  outgoing Direct Challenge (the mirror form, `accept_until` dated from the
+  stamp), the profile (`bot: true` always), the contact list, the mute
+  list, the Challenge Policy. Each type fixes its window, whether it is
+  mined, its convergence (`Collapses`, `EarliestWins`, `Replaceable`,
+  `NotIdempotent`) and whether it may take the governor's reserve. A draft
+  is a function of its stamp: `Expired`, `Moot` or `Malformed` withhold it.
+  A third party's draft does not compile (a `compile_fail` doctest).
+- **`publisher`** — the Publisher of ADR-0045 §6: one queue ordered by
+  `not_after`, a token governor over a 62 s window with the reserve of a
+  tenth kept from standing events and outgoing challenges, stamps
+  `max(floor(now) + 1, not_before)` on the relay's estimated clock,
+  monotone per replaceable coordinate; at open, the lease on
+  `<data_dir>/<pubkey>.lock` (`KeyInUse` otherwise), the relay's round trip,
+  the mining benchmark and the latency bound; every event carries the
+  `client` tag `sanki-bot` and, on the kinds that prescribe it, a `nonce`
+  mined off the executor. Outcomes: `Accepted` (a `duplicate:` included),
+  `Rejected` (classified `Stale`, `Future`, `Pow`, `RateLimited`,
+  `Blocked`, `Invalid`; a timing rejection corrects the skew estimate and
+  re-stamps once, `Pow` re-reads NIP-11 and re-mines once, `RateLimited`
+  is logged at `error` and retried once), `Unknown` handled by convergence
+  (a Ply resent unchanged while fresh, then re-stamped; an `EarliestWins`
+  draft resolved by id on the relay itself and re-signed only when the
+  relay answered that it is absent; a `NotIdempotent` draft handed back),
+  `Withheld`, `Failed`, `Closed`. `resolve(id)` answers `Found`,
+  `ConfirmedAbsent` or `Unknown` — a relay that does not answer proves
+  nothing. Fifteen tests over the in-process relay.
+- **`testing`** — three more faults on the mini relay: a per-signer rate
+  limit with the reference wording, events stored but not acknowledged,
+  and silence to every query.
 
 ### Fixed
 

@@ -25,8 +25,11 @@ the decision conform to the suite's NIPs and to the session's rule system.
 | `chain` | the live view of a session at an instant: the selected chain, the tip, whose turn, the clocks, the predicted verdict — and the chain in canonical PMN, ready for an SEI `search` |
 | `notation` | the Ply content ↔ canonical PMN converters, on `sashite_sanki_engine::pmn` |
 | `clock`, `cadence` | how many seconds a mover may still take; the cadence family of a time control |
+| `readers` | typed readers of the suite's kinds — the Direct Challenge, the Game Session's founding, the rating attestation, the Challenge Policy, the profile and the lists — or the reason an event does not conform |
+| `drafts` | the sealed drafts a bot publishes: a Ply, a Game Session, a Conclusion, a Direct Challenge, the standing events — each with its window, its proof of work and its convergence |
+| `publisher` | one queue ordered by deadline, the token governor with its reserve, stamping without backdating, the outcomes and what each convergence does with a missing acknowledgment, the lease on the host |
 | `relay` | the relay's NIP-11 document, read as a self-timed client must: the `created_at` window, the covered kinds, the proof-of-work minimum |
-| `publish` | self-timed stamping against the relay's estimated clock, NIP-13 mining, the stale and future rejections learnt |
+| `publish` | the primitives: the relay's estimated clock, NIP-13 mining, `publish_self_timed` for a caller without the Publisher |
 | `tags` | readers of the suite's tag conventions |
 | `testing` | an in-process NIP-01 relay with the strict window, a clock skew and the proof of work switchable (feature `testing`) |
 
@@ -62,13 +65,28 @@ let view = chain::session_view(&mut oracle, &terms, t0, &events, now)?;
 // `{"position": terms.position, "moves": view.moves, ...}`.
 ```
 
+```rust
+use sashite_sanki_client::drafts::Ply;
+use sashite_sanki_client::publisher::{Outcome, Publisher, Settings};
+
+// One writer: the signer moves into the Publisher, which takes the lease.
+let settings = Settings::from_relay_info(relay_url, &relay_info, rate_per_minute, data_dir);
+let publisher = Publisher::open(client, signer, settings).await?;
+
+// A draft is a function of its stamp; the Publisher stamps, mines, signs,
+// sends, and says what became of it.
+match publisher.publish(Ply { session, opponent, step, content, draw: false, not_before, not_after }).await {
+    Outcome::Accepted(event) => { /* on the relay */ }
+    Outcome::Withheld(why) => { /* expired, or moot */ }
+    other => { /* rejected, unknown, failed, closed */ }
+}
+```
+
 ## What it does not do
 
 It sends no challenge, founds no session, plays no move and claims no verdict
-on its own; it holds no key beyond the signing a caller asks for; it has no
-configuration. The `Publisher` of ADR-0045 §6 — one queue, the token governor,
-the sealed drafts and their convergence — comes with the bot's SEI refactor;
-until then a caller stamps, mines and sends with `publish::publish_self_timed`.
+on its own; it holds no key beyond the signing a caller asks for — a signer
+the caller moves into the `Publisher`; it has no configuration.
 
 ## Licence
 
