@@ -23,7 +23,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 
 use crate::clock::max_affordable;
-use crate::module::{self, End, Oracle, Verdict, VerdictAt};
+use crate::module::{self, Clocks, End, Oracle, Verdict, VerdictAt};
 use crate::notation;
 use crate::session::{Events, Seat, SessionTerms};
 
@@ -60,6 +60,8 @@ pub struct SessionView {
     pub anchor: u64,
     /// Seconds the mover may take past `anchor` before flagging.
     pub affordable: u64,
+    /// Both clocks as the replay left them, while the session goes on.
+    pub clocks: Option<Clocks>,
     /// Whether the LAST chain ply carries the `draw` offer flag.
     pub last_ply_offers_draw: bool,
 }
@@ -145,10 +147,10 @@ pub fn session_view(
     }
 
     let chain_len = state.chain.len();
-    let (terminal, next_half_move, tip, anchor, affordable) = match state.end {
+    let (terminal, next_half_move, tip, anchor, affordable, clocks) = match state.end {
         End::Terminal { at, .. } => {
             let next = u32::try_from(chain_len.saturating_add(1)).unwrap_or(u32::MAX);
-            (true, next, position, at, 0)
+            (true, next, position, at, 0, None)
         }
         End::Ongoing {
             anchor,
@@ -171,6 +173,7 @@ pub fn session_view(
                 end_position,
                 anchor,
                 max_affordable(&terms.time_control, clock),
+                Some(clocks),
             )
         }
     };
@@ -188,6 +191,7 @@ pub fn session_view(
         halfmove_clock,
         anchor,
         affordable,
+        clocks,
         last_ply_offers_draw,
     })
 }

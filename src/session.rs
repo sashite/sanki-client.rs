@@ -757,6 +757,9 @@ pub mod fixtures {
         pub matchmaker: Keys,
         pub timestamper: Keys,
         pub rules: EventId,
+        /// The one period of the founding's time control (`300`, `3` by
+        /// default: 5 + 3 Fischer).
+        pub time_control: Vec<String>,
     }
 
     impl Default for World {
@@ -774,6 +777,7 @@ pub mod fixtures {
                 matchmaker: Keys::generate(),
                 timestamper: Keys::generate(),
                 rules: EventId::from_hex(&"7".repeat(64)).unwrap(),
+                time_control: vec!["300".to_owned(), "3".to_owned()],
             }
         }
 
@@ -804,7 +808,10 @@ pub mod fixtures {
                 Tag::parse(["variant", &self.second.public_key().to_hex(), sv]).unwrap(),
                 Tag::parse(["seat", &self.first.public_key().to_hex(), "first"]).unwrap(),
                 Tag::parse(["seat", &self.second.public_key().to_hex(), "second"]).unwrap(),
-                Tag::parse(["time_control", "300", "3"]).unwrap(),
+                Tag::parse(
+                    std::iter::once("time_control".to_owned()).chain(self.time_control.clone()),
+                )
+                .unwrap(),
                 Tag::parse(["found_until", "2000000000"]).unwrap(),
             ];
             match timing {

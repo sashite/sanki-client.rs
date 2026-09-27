@@ -46,6 +46,14 @@ pub trait Oracle {
     fn answer(&mut self, request: &[u8]) -> Option<Vec<u8>>;
 }
 
+/// A boxed oracle answers as the oracle it holds — so that one module
+/// instance, behind a lock, serves every operation of this module.
+impl<O: Oracle + ?Sized> Oracle for Box<O> {
+    fn answer(&mut self, request: &[u8]) -> Option<Vec<u8>> {
+        (**self).answer(request)
+    }
+}
+
 /// Why a module could not be instantiated as a conforming one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]

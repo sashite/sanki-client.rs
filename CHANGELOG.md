@@ -71,6 +71,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **`testing`** — three more faults on the mini relay: a per-signer rate
   limit with the reference wording, events stored but not acknowledged,
   and silence to every query.
+- `chain::SessionView` carries the `clocks` the module computes at the
+  tip (`None` when the session ended): what an SEI `clock` is built from.
+- `Oracle` for `Box<O>`: a shared `Box<dyn Oracle + Send>` serves every
+  call taking `&mut impl Oracle`.
+- `session::fixtures::World` takes its `time_control` (default
+  `["300", "3"]`): a short bank for a runtime's tests.
 
 ### Fixed
 
