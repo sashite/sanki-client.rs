@@ -41,8 +41,12 @@ private = { ignore = true }
 # Duplicate versions are common across the nostr / rustls tree; surface them as
 # a warning rather than failing the build.
 multiple-versions = "warn"
-# Reject wildcard ("*") version requirements in our own manifest.
+# Reject wildcard ("*") version requirements in our own manifest — except on
+# a path dependency: the crate's dev-dependency on itself (the `testing`
+# feature for its own tests) carries no version, so that `cargo publish`
+# strips it instead of looking for the crate on crates.io.
 wildcards = "deny"
+allow-wildcard-paths = true
 
 [sources]
 # All dependencies must resolve from crates.io; reject unknown registries/git.
