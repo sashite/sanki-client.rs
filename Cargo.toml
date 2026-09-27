@@ -52,7 +52,7 @@ tokio-tungstenite = { version = "0.26", optional = true }
 futures-util = "0.3"
 
 [dev-dependencies]
-sashite-sanki-client = { path = ".", features = ["testing"] }
+sashite-sanki-client = { path = ".", version = "0.1.0", features = ["testing"] }
 # Hand-written modules of the wrong shape, for the runtime's refusal tests.
 wat = "1"
 
