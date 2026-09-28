@@ -669,3 +669,90 @@ fn prefix_match(actual: Option<&Value>, wanted: &Value) -> bool {
             .any(|prefix| actual.starts_with(prefix))
     })
 }
+
+/// A conforming Pairing (kind `3419`) of two Open Challenges, signed by
+/// `matchmaker` — what a scripted matchmaker publishes in a test: the two
+/// references in the given order, the two players, the timing designation
+/// and the `rules` mirrored from `a`, `first` seated first, the variants
+/// as given (`a`'s, then `b`'s), the time control `a`'s rows verbatim.
+/// Nothing is checked: a test builds a non-conforming one on purpose by
+/// giving what the constraints forbid.
+#[must_use]
+pub fn pairing_of(
+    matchmaker: &nostr_sdk::prelude::Keys,
+    a: &crate::readers::OpenChallenge,
+    b: &crate::readers::OpenChallenge,
+    first: &nostr_sdk::prelude::PublicKey,
+    variants: (&str, &str),
+    created_at: u64,
+    found_until: u64,
+) -> nostr_sdk::prelude::Event {
+    use nostr_sdk::prelude::*;
+
+    let relay = match &a.timing {
+        crate::session::Timing::SelfTimed(relay) => relay.clone(),
+        crate::session::Timing::Attested(_) => String::new(),
+    };
+    let mut tags = vec![
+        Tag::custom(
+            "e",
+            [a.id.to_hex(), relay.clone(), "open_challenge".to_owned()],
+        ),
+        Tag::custom(
+            "e",
+            [b.id.to_hex(), relay.clone(), "open_challenge".to_owned()],
+        ),
+        Tag::custom("p", [a.signer.to_hex(), relay.clone(), "player".to_owned()]),
+        Tag::custom("p", [b.signer.to_hex(), relay.clone(), "player".to_owned()]),
+    ];
+    match &a.timing {
+        crate::session::Timing::SelfTimed(relay) => {
+            tags.push(Tag::custom("timing_relay", [relay.clone()]));
+        }
+        crate::session::Timing::Attested(timestamper) => {
+            tags.push(Tag::custom(
+                "p",
+                [
+                    timestamper.to_hex(),
+                    String::new(),
+                    "timestamper".to_owned(),
+                ],
+            ));
+        }
+    }
+    tags.push(Tag::custom("game", [a.game.clone()]));
+    tags.push(Tag::custom(
+        "e",
+        [a.rules.to_hex(), relay, "rules".to_owned()],
+    ));
+    tags.push(Tag::custom(
+        "variant",
+        [a.signer.to_hex(), variants.0.to_owned()],
+    ));
+    tags.push(Tag::custom(
+        "variant",
+        [b.signer.to_hex(), variants.1.to_owned()],
+    ));
+    let (first_key, second_key) = if first == &a.signer {
+        (a.signer, b.signer)
+    } else {
+        (b.signer, a.signer)
+    };
+    tags.push(Tag::custom(
+        "seat",
+        [first_key.to_hex(), "first".to_owned()],
+    ));
+    tags.push(Tag::custom(
+        "seat",
+        [second_key.to_hex(), "second".to_owned()],
+    ));
+    for row in &a.rows {
+        tags.push(Tag::custom("time_control", row.clone()));
+    }
+    tags.push(Tag::custom("found_until", [found_until.to_string()]));
+    EventBuilder::new(Kind::Custom(crate::session::KIND_PAIRING), "")
+        .tags(tags)
+        .custom_created_at(Timestamp::from(created_at))
+        .finalize(matchmaker)
+        .expect("a valid event")
+}

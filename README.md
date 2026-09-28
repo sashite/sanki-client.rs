@@ -25,8 +25,8 @@ the decision conform to the suite's NIPs and to the session's rule system.
 | `chain` | the live view of a session at an instant: the selected chain, the tip, whose turn, the clocks, the predicted verdict — and the chain in canonical PMN, ready for an SEI `search` |
 | `notation` | the Ply content ↔ canonical PMN converters, on `sashite_sanki_engine::pmn` |
 | `clock`, `cadence` | how many seconds a mover may still take; the cadence family of a time control |
-| `readers` | typed readers of the suite's kinds — the Direct Challenge, the Game Session's founding, the rating attestation, the Challenge Policy, the profile and the lists — or the reason an event does not conform |
-| `drafts` | the sealed drafts a bot publishes: a Ply, a Game Session, a Conclusion, a Direct Challenge, the standing events — each with its window, its proof of work and its convergence |
+| `readers` | typed readers of the suite's kinds — the Open Challenge, the Pairing against its two entries, the Direct Challenge, the Game Session's founding, the rating attestation, the Challenge Policy, the profile, the lists and the relay list — or the reason an event does not conform |
+| `drafts` | the sealed drafts a bot publishes: a Ply, a Game Session, a Conclusion, a Direct Challenge, an Open Challenge, the standing events (the relay list among them) — each with its window, its proof of work and its convergence |
 | `publisher` | one queue ordered by deadline, the token governor with its reserve, stamping without backdating, the outcomes and what each convergence does with a missing acknowledgment, the lease on the host |
 | `relay` | the relay's NIP-11 document, read as a self-timed client must: the `created_at` window, the covered kinds, the proof-of-work minimum |
 | `publish` | the primitives: the relay's estimated clock, NIP-13 mining, `publish_self_timed` for a caller without the Publisher |

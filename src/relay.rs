@@ -26,6 +26,12 @@ use std::time::Duration;
 /// the Conclusion (ADR-0045 §1).
 pub const SESSION_KINDS: [u16; 4] = [3420, 3422, 3423, 3425];
 
+/// The kinds of the pool (ADR-0047): the Open Challenge — never timed, but
+/// written with the bot's key, so watched by an echo detector — and the
+/// Pairing, whose canonical timing is its `created_at` and which the
+/// relay's window must therefore cover for a bot that enters the pool.
+pub const POOL_KINDS: [u16; 2] = [3418, 3419];
+
 /// The widest past tolerance still countable as the strict anti-backdating
 /// rule, in seconds: the reference relay enforces 1 s; a relay admitting
 /// more than a few seconds is useless as a timing source.

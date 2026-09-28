@@ -6,13 +6,17 @@
 //! interpreting them. They are pure functions over a borrowed [`Event`], so they
 //! are independently testable and shared by the courtship, session and
 //! conclusion layers.
+//!
+//! An id or a pubkey is read in the one form the suite's kinds write it:
+//! 64 lowercase hex characters ([`hex_id`], [`hex_pubkey`]) — a `note1…`,
+//! an `npub1…` or uppercase hex names nothing here.
 
 use nostr_sdk::prelude::*;
 
 /// The pubkey of the `p` tag carrying the given role marker, if any
 /// (`["p", "<pubkey>", "<relay>", "<role>"]`).
 pub fn pubkey_with_role(event: &Event, role: &str) -> Option<PublicKey> {
-    marked_value(event, "p", role).and_then(|v| PublicKey::parse(v).ok())
+    marked_value(event, "p", role).and_then(hex_pubkey)
 }
 
 /// Every pubkey of `p` tags carrying the given role marker, in tag order
@@ -26,7 +30,7 @@ pub fn pubkeys_with_role(event: &Event, role: &str) -> Vec<PublicKey> {
             if s.first().map(String::as_str) == Some("p")
                 && s.get(3).map(String::as_str) == Some(role)
             {
-                s.get(1).and_then(|v| PublicKey::parse(v).ok())
+                s.get(1).and_then(|v| hex_pubkey(v))
             } else {
                 None
             }
@@ -37,7 +41,7 @@ pub fn pubkeys_with_role(event: &Event, role: &str) -> Vec<PublicKey> {
 /// The event id of the `e` tag carrying the given marker, if any
 /// (`["e", "<id>", "<relay>", "<marker>"]`).
 pub fn event_with_marker(event: &Event, marker: &str) -> Option<EventId> {
-    marked_value(event, "e", marker).and_then(|v| EventId::parse(v).ok())
+    marked_value(event, "e", marker).and_then(hex_id)
 }
 
 /// The event ids of every `e` tag carrying the given marker, in tag order —
@@ -52,12 +56,37 @@ pub fn events_with_marker(event: &Event, marker: &str) -> Vec<EventId> {
             if s.first().map(String::as_str) == Some("e")
                 && s.get(3).map(String::as_str) == Some(marker)
             {
-                s.get(1).and_then(|v| EventId::parse(v).ok())
+                s.get(1).and_then(|v| hex_id(v))
             } else {
                 None
             }
         })
         .collect()
+}
+
+/// An event id in the form the suite's kinds write it: 64 lowercase hex
+/// characters — not a `note1…`, not uppercase.
+#[must_use]
+pub fn hex_id(text: &str) -> Option<EventId> {
+    is_lower_hex(text, 64)
+        .then(|| EventId::from_hex(text).ok())
+        .flatten()
+}
+
+/// A public key in the form the suite's kinds write it: 64 lowercase hex
+/// characters — not an `npub1…`, not uppercase.
+#[must_use]
+pub fn hex_pubkey(text: &str) -> Option<PublicKey> {
+    is_lower_hex(text, 64)
+        .then(|| PublicKey::from_hex(text).ok())
+        .flatten()
+}
+
+fn is_lower_hex(text: &str, len: usize) -> bool {
+    text.len() == len
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// The second element of every tag named `name`, in tag order (empty when the
@@ -145,7 +174,7 @@ fn keyed_value<'a>(event: &'a Event, name: &str, pubkey: &PublicKey) -> Option<&
     event.tags.iter().find_map(|tag| {
         let s = tag.as_slice();
         if s.first().map(String::as_str) == Some(name)
-            && s.get(1).and_then(|v| PublicKey::parse(v).ok()).as_ref() == Some(pubkey)
+            && s.get(1).and_then(|v| hex_pubkey(v)).as_ref() == Some(pubkey)
         {
             s.get(2).map(String::as_str)
         } else {

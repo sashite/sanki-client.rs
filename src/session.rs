@@ -43,6 +43,8 @@ pub const KIND_PLY: u16 = 3423;
 pub const KIND_CONCLUSION: u16 = 3425;
 /// The Event Timestamp Attestation kind.
 pub const KIND_ATTESTATION: u16 = 3410;
+/// The Open Challenge kind (a pool entry).
+pub const KIND_OPEN_CHALLENGE: u16 = 3418;
 /// The Pairing kind (a matchmade founding).
 pub const KIND_PAIRING: u16 = 3419;
 /// The Direct Challenge kind (a directed founding).

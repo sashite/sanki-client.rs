@@ -4,6 +4,51 @@ All notable changes to this project are documented in this file. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] — 2026-09-28
+
+The verbs of the pool and of the profile abroad (ADR-0047 §Plan step 1),
+for a bot that enters the matchmaking pool and is found on the public
+relays. Nothing of 0.1 changes.
+
+### Added
+
+- **`readers::open_challenge`** (kind `3418`): the nine semantic
+  constraints of the kind, the absence of an NIP-40 `expiration` tag and
+  of any `e` tag but the `rules` reference; the `filter` in its three
+  forms (`Filter`, `RatingScope`), the role-keyed variants, the periods
+  and their rows verbatim.
+- **`readers::pairing`** (kind `3419`), read **against its two Open
+  Challenges** in either order: the consent constraints 1 to 9 and 11 to
+  15 — the signer the matchmaker of both, the references, the players,
+  the seats, the timing designation identical to both entries', the game,
+  the variants respecting every role term, the time control identical in
+  presence and value, the rules, `created_at` within both `accept_until`,
+  the matchmaker no player, an empty content, `found_until`, no arbiter.
+  Constraint 10 (the filters, external data) is the caller's.
+- **`readers::relay_list`** (kind `10002`): the relays of the `r` tags.
+- **`drafts::OpenChallenge`**: the mirror entry — both roles fixed to one
+  variant, the courted entry's periods, the bot's own filter, an
+  **absolute** `accept_until` and a window that never reaches it; mined,
+  outside the reserve, `NotIdempotent` (two live entries are two
+  Pairings). **`drafts::RelayList`** (kind `10002`), a standing event.
+- **`relay::POOL_KINDS`** (`3418`, `3419`): what a bot entering the pool
+  checks the relay's window for, and watches for echoes.
+- **`testing::pairing_of`**: a scripted matchmaker's Pairing of two
+  entries — conforming, or not, as the test asks — for the bot's tests.
+- `session::KIND_OPEN_CHALLENGE`; `tags::hex_id` and `tags::hex_pubkey`.
+
+### Changed
+
+- **An id or a pubkey is read in the suite's one form**, 64 lowercase hex
+  characters: a `rules` reference, a `p` tag's key, a `seat` or `variant`
+  keyed by pubkey written as `note1…`, `npub1…` or uppercase hex names
+  nothing — the readers refuse what the kinds' wording (kind `3420`
+  constraint 10, kind `3419` §Match-terms tags) forbids, where
+  `nostr-sdk`'s parsers admitted it.
+- `readers::pairing` compares `created_at` to the entries' `accept_until`
+  in self-timed mode only; in attested mode the canonical timing is the
+  attestation's, the caller's to compare.
+
 ## [0.1.2] — 2026-09-28
 
 ### Fixed

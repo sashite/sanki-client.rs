@@ -7,6 +7,8 @@
 //!
 //! | Kind | Reader |
 //! |---|---|
+//! | `3418` | [`open_challenge`] |
+//! | `3419` | [`pairing`], against its two Open Challenges |
 //! | `3420` | [`direct_challenge`] |
 //! | `3422` | [`founding_of`] (the founding reference; the terms are [`crate::session::terms`]) |
 //! | `3426` | [`rating_attestation`] |
@@ -14,6 +16,7 @@
 //! | `0` | [`profile`] |
 //! | `3` | [`contacts`] |
 //! | `10000` | [`mute_list`] |
+//! | `10002` | [`relay_list`] |
 //!
 //! The Ply and the Conclusion are read for the module by
 //! [`crate::session::ply`] and [`crate::session::conclusion`]; the Rule
@@ -24,7 +27,9 @@ use std::fmt;
 use nostr_sdk::prelude::*;
 use serde_json::Value;
 
-use crate::session::{self, Seat, Timing, KIND_DIRECT_CHALLENGE, KIND_GAME_SESSION, KIND_PAIRING};
+use crate::session::{
+    self, Seat, Timing, KIND_DIRECT_CHALLENGE, KIND_GAME_SESSION, KIND_OPEN_CHALLENGE, KIND_PAIRING,
+};
 use crate::tags;
 
 /// The Elo Rating Attestation kind.
@@ -33,6 +38,8 @@ pub const KIND_RATING_ATTESTATION: u16 = 3426;
 pub const KIND_CHALLENGE_POLICY: u16 = 30420;
 /// The mute list kind (NIP-51).
 pub const KIND_MUTE_LIST: u16 = 10000;
+/// The relay list kind (NIP-65).
+pub const KIND_RELAY_LIST: u16 = 10002;
 
 /// Why an event is not read: its kind, and the constraint it fails.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,6 +82,515 @@ pub fn has_client_tag(event: &Event, name: &str) -> bool {
     event.tags.iter().map(Tag::as_slice).any(|s| {
         s.first().map(String::as_str) == Some("client")
             && s.get(1).map(String::as_str) == Some(name)
+    })
+}
+
+// ---- 3418 ----
+
+/// The pool scope of a `rating` filter (kind `3418` §Match-terms tags).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RatingScope {
+    /// Every attestation of the game, whatever the variants.
+    PerGame,
+    /// The attestations of the player's resolved variant only.
+    PerVariant,
+}
+
+impl RatingScope {
+    /// The token.
+    #[must_use]
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::PerGame => "pergame",
+            Self::PerVariant => "pervariant",
+        }
+    }
+
+    /// From its token.
+    #[must_use]
+    pub fn parse(token: &str) -> Option<Self> {
+        match token {
+            "pergame" => Some(Self::PerGame),
+            "pervariant" => Some(Self::PerVariant),
+            _ => None,
+        }
+    }
+}
+
+/// The `filter` of an Open Challenge: which opponents the signer accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Filter {
+    /// Any opponent (the default, the tag absent).
+    Everyone,
+    /// The signer's contact list.
+    Following,
+    /// Within `max_delta` by the pinned authority's attestations.
+    Rating {
+        /// 1 to 1,000.
+        max_delta: u32,
+        /// The rating authority.
+        authority: PublicKey,
+        /// `3426` or `3427`.
+        kind: u16,
+        /// The pool scope.
+        scope: RatingScope,
+    },
+}
+
+/// An Open Challenge (kind `3418`), read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenChallenge {
+    /// The event id.
+    pub id: EventId,
+    /// The player entering the pool.
+    pub signer: PublicKey,
+    /// `created_at`.
+    pub created_at: u64,
+    /// The designated matchmaker.
+    pub matchmaker: PublicKey,
+    /// The timing designation.
+    pub timing: Timing,
+    /// The game identifier.
+    pub game: String,
+    /// The Rule System event.
+    pub rules: EventId,
+    /// The signer's own variant, when fixed.
+    pub self_variant: Option<String>,
+    /// The sought opponent's variant, when fixed.
+    pub opponent_variant: Option<String>,
+    /// The periods, in the ABI's encoding.
+    pub time_control: Vec<[Option<u64>; 3]>,
+    /// The `time_control` rows verbatim.
+    pub rows: Vec<Vec<String>>,
+    /// The filter.
+    pub filter: Filter,
+    /// `accept_until`.
+    pub accept_until: u64,
+}
+
+/// Reads an Open Challenge: the nine semantic constraints of kind `3418`
+/// (the resolution of the `rules` reference excepted), the absence of an
+/// NIP-40 `expiration` tag, and no `e` tag but the `rules` reference.
+///
+/// # Errors
+///
+/// The first constraint it fails.
+pub fn open_challenge(event: &Event) -> Result<OpenChallenge, NonConforming> {
+    const K: u16 = KIND_OPEN_CHALLENGE;
+    accept(event, K)?;
+    let signer = event.pubkey;
+    let mut matchmakers = Vec::new();
+    for tag in event.tags.iter().map(Tag::as_slice) {
+        if tag.first().map(String::as_str) != Some("p") {
+            continue;
+        }
+        let Some(pubkey) = tag.get(1).and_then(|hex| PublicKey::from_hex(hex).ok()) else {
+            return Err(NonConforming::new(K, "malformed p tag"));
+        };
+        match tag.get(3).map(String::as_str) {
+            Some("matchmaker") => matchmakers.push(pubkey),
+            Some("timestamper") => {}
+            _ => return Err(NonConforming::new(K, "a p tag without a role marker")),
+        }
+        if pubkey == signer {
+            return Err(NonConforming::new(K, "a p tag names the signer"));
+        }
+    }
+    let [matchmaker] = matchmakers.as_slice() else {
+        return Err(NonConforming::new(K, "not exactly one matchmaker"));
+    };
+    let matchmaker = *matchmaker;
+    let timing = session::timing_of(event)
+        .ok_or(NonConforming::new(K, "not exactly one timing designation"))?;
+    if let Timing::SelfTimed(relay) = &timing {
+        if !relay.starts_with("wss://") {
+            return Err(NonConforming::new(
+                K,
+                "the timing relay is not a wss:// URL",
+            ));
+        }
+    }
+    let game = session::exactly_one(event, "game")
+        .filter(|g| session::is_identifier(g))
+        .ok_or(NonConforming::new(K, "not exactly one valid game"))?
+        .to_owned();
+    let mut self_variant = None;
+    let mut opponent_variant = None;
+    for tag in event.tags.iter().map(Tag::as_slice) {
+        if tag.first().map(String::as_str) != Some("variant") {
+            continue;
+        }
+        let (Some(role), Some(variant), None) = (tag.get(1), tag.get(2), tag.get(3)) else {
+            return Err(NonConforming::new(K, "malformed variant tag"));
+        };
+        if !session::is_identifier(variant) {
+            return Err(NonConforming::new(K, "invalid variant identifier"));
+        }
+        let slot = match role.as_str() {
+            "self" => &mut self_variant,
+            "opponent" => &mut opponent_variant,
+            _ => {
+                return Err(NonConforming::new(
+                    K,
+                    "a variant role outside self and opponent",
+                ))
+            }
+        };
+        if slot.is_some() {
+            return Err(NonConforming::new(K, "two variants for one role"));
+        }
+        *slot = Some(variant.clone());
+    }
+    let time_control = periods(event, K)?;
+    let filter = filter_of(event, K)?;
+    let accept_until = session::exactly_one(event, "accept_until")
+        .and_then(session::decimal)
+        .ok_or(NonConforming::new(K, "not exactly one valid accept_until"))?;
+    if accept_until <= event.created_at.as_secs() {
+        return Err(NonConforming::new(
+            K,
+            "accept_until is not after created_at",
+        ));
+    }
+    if !session::pow_ok(event) {
+        return Err(NonConforming::new(K, "no honoured nonce"));
+    }
+    if !event.content.is_empty() {
+        return Err(NonConforming::new(K, "content is not empty"));
+    }
+    if !tags::values(event, "expiration").is_empty() {
+        return Err(NonConforming::new(K, "an expiration tag"));
+    }
+    let rules = session::rules_ref(event)
+        .ok_or(NonConforming::new(K, "not exactly one rules reference"))?;
+    if tags::count_named(event, "e") != 1 {
+        return Err(NonConforming::new(
+            K,
+            "an e tag besides the rules reference",
+        ));
+    }
+    Ok(OpenChallenge {
+        id: event.id,
+        signer,
+        created_at: event.created_at.as_secs(),
+        matchmaker,
+        timing,
+        game,
+        rules,
+        self_variant,
+        opponent_variant,
+        time_control,
+        rows: tags::time_control_rows(event),
+        filter,
+        accept_until,
+    })
+}
+
+/// The `filter` tag of an Open Challenge: zero or one, in one of its forms.
+fn filter_of(event: &Event, kind: u16) -> Result<Filter, NonConforming> {
+    let rows: Vec<&[String]> = event
+        .tags
+        .iter()
+        .map(Tag::as_slice)
+        .filter(|s| s.first().map(String::as_str) == Some("filter"))
+        .collect();
+    let row = match rows.as_slice() {
+        [] => return Ok(Filter::Everyone),
+        [row] => *row,
+        _ => return Err(NonConforming::new(kind, "several filter tags")),
+    };
+    let mode = row.get(1).map(String::as_str);
+    match (mode, row.len()) {
+        (Some("everyone"), 2) => Ok(Filter::Everyone),
+        (Some("following"), 2) => Ok(Filter::Following),
+        (Some("rating"), 6) => {
+            let max_delta = row
+                .get(2)
+                .and_then(|d| session::decimal(d))
+                .filter(|d| (1..=1000).contains(d))
+                .and_then(|d| u32::try_from(d).ok())
+                .ok_or(NonConforming::new(kind, "max_delta outside 1 to 1000"))?;
+            let authority = row
+                .get(3)
+                .and_then(|hex| tags::hex_pubkey(hex))
+                .ok_or(NonConforming::new(kind, "malformed rating authority"))?;
+            let kind_value = match row.get(4).map(String::as_str) {
+                Some("3426") => 3426,
+                Some("3427") => 3427,
+                _ => {
+                    return Err(NonConforming::new(
+                        kind,
+                        "a rating kind outside 3426 and 3427",
+                    ))
+                }
+            };
+            let scope =
+                row.get(5)
+                    .and_then(|s| RatingScope::parse(s))
+                    .ok_or(NonConforming::new(
+                        kind,
+                        "a pool scope outside pergame and pervariant",
+                    ))?;
+            Ok(Filter::Rating {
+                max_delta,
+                authority,
+                kind: kind_value,
+                scope,
+            })
+        }
+        _ => Err(NonConforming::new(kind, "malformed filter")),
+    }
+}
+
+// ---- 3419 ----
+
+/// A Pairing (kind `3419`), read against its two Open Challenges.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pairing {
+    /// The event id.
+    pub id: EventId,
+    /// The matchmaker.
+    pub matchmaker: PublicKey,
+    /// `created_at`: the canonical timing, in self-timed mode.
+    pub created_at: u64,
+    /// The two Open Challenges paired, in tag order.
+    pub entries: [EventId; 2],
+    /// The player seated `first`.
+    pub first: PublicKey,
+    /// The player seated `second`.
+    pub second: PublicKey,
+    /// The `first` player's resolved variant.
+    pub first_variant: String,
+    /// The `second` player's resolved variant.
+    pub second_variant: String,
+    /// The game.
+    pub game: String,
+    /// The Rule System event.
+    pub rules: EventId,
+    /// The timing designation, mirrored from both entries.
+    pub timing: Timing,
+    /// The periods.
+    pub time_control: Vec<[Option<u64>; 3]>,
+    /// `found_until`.
+    pub found_until: u64,
+}
+
+impl Pairing {
+    /// The other player.
+    #[must_use]
+    pub fn opponent_of(&self, pubkey: &PublicKey) -> Option<PublicKey> {
+        if *pubkey == self.first {
+            Some(self.second)
+        } else if *pubkey == self.second {
+            Some(self.first)
+        } else {
+            None
+        }
+    }
+
+    /// A player's resolved variant.
+    #[must_use]
+    pub fn variant_of(&self, pubkey: &PublicKey) -> Option<&str> {
+        if *pubkey == self.first {
+            Some(&self.first_variant)
+        } else if *pubkey == self.second {
+            Some(&self.second_variant)
+        } else {
+            None
+        }
+    }
+}
+
+/// Reads a Pairing against the two Open Challenges it references, each
+/// read by [`open_challenge`]: the consent constraints 1 to 9 and 11 to 15
+/// of kind `3419`. Constraint 10 (the filters, external data at the
+/// Pairing's timing) is the caller's — or, for a bot, decided at its entry
+/// (ADR-0047 §1). The entries may be given in either order.
+///
+/// # Errors
+///
+/// The first constraint it fails.
+pub fn pairing(event: &Event, entries: [&OpenChallenge; 2]) -> Result<Pairing, NonConforming> {
+    const K: u16 = KIND_PAIRING;
+    accept(event, K)?;
+    let matchmaker = event.pubkey;
+    // 1. Exactly two open_challenge references, the entries, distinct signers;
+    //    no other e tag but rules.
+    let referenced = tags::events_with_marker(event, "open_challenge");
+    let [ref_a, ref_b] = referenced.as_slice() else {
+        return Err(NonConforming::new(
+            K,
+            "not exactly two open_challenge references",
+        ));
+    };
+    let (a, b) = if (*ref_a, *ref_b) == (entries[0].id, entries[1].id) {
+        (entries[0], entries[1])
+    } else if (*ref_a, *ref_b) == (entries[1].id, entries[0].id) {
+        (entries[1], entries[0])
+    } else {
+        return Err(NonConforming::new(
+            K,
+            "the references are not the two entries",
+        ));
+    };
+    if a.signer == b.signer {
+        return Err(NonConforming::new(K, "the two entries have one signer"));
+    }
+    if tags::count_named(event, "e") != 3 {
+        return Err(NonConforming::new(K, "an e tag besides the references"));
+    }
+    // 2. The matchmaker of both.
+    if a.matchmaker != matchmaker || b.matchmaker != matchmaker {
+        return Err(NonConforming::new(
+            K,
+            "not signed by the entries' matchmaker",
+        ));
+    }
+    // 3. Two player tags, the two signers; 15. no arbiter; every p tag marked.
+    let mut players = Vec::new();
+    for tag in event.tags.iter().map(Tag::as_slice) {
+        if tag.first().map(String::as_str) != Some("p") {
+            continue;
+        }
+        let Some(pubkey) = tag.get(1).and_then(|hex| PublicKey::from_hex(hex).ok()) else {
+            return Err(NonConforming::new(K, "malformed p tag"));
+        };
+        match tag.get(3).map(String::as_str) {
+            Some("player") => players.push(pubkey),
+            Some("timestamper") => {}
+            Some("arbiter") => return Err(NonConforming::new(K, "an arbiter")),
+            _ => return Err(NonConforming::new(K, "a p tag without a role marker")),
+        }
+    }
+    let [p, q] = players.as_slice() else {
+        return Err(NonConforming::new(K, "not exactly two players"));
+    };
+    if !((*p == a.signer && *q == b.signer) || (*p == b.signer && *q == a.signer)) {
+        return Err(NonConforming::new(
+            K,
+            "the players are not the entries' signers",
+        ));
+    }
+    // 12. The matchmaker is neither player.
+    if matchmaker == a.signer || matchmaker == b.signer {
+        return Err(NonConforming::new(K, "the matchmaker is a player"));
+    }
+    // 4. The seats.
+    if tags::count_named(event, "seat") != 2 {
+        return Err(NonConforming::new(K, "not exactly two seats"));
+    }
+    let (first, second) = match (
+        tags::seat_for(event, &a.signer).and_then(Seat::parse),
+        tags::seat_for(event, &b.signer).and_then(Seat::parse),
+    ) {
+        (Some(Seat::First), Some(Seat::Second)) => (a.signer, b.signer),
+        (Some(Seat::Second), Some(Seat::First)) => (b.signer, a.signer),
+        _ => {
+            return Err(NonConforming::new(
+                K,
+                "the seats are not one first and one second",
+            ))
+        }
+    };
+    // 5. The timing designation, the entries' and identical between them.
+    if a.timing != b.timing {
+        return Err(NonConforming::new(
+            K,
+            "the entries' timing designations differ",
+        ));
+    }
+    let timing = session::timing_of(event)
+        .ok_or(NonConforming::new(K, "not exactly one timing designation"))?;
+    if timing != a.timing {
+        return Err(NonConforming::new(
+            K,
+            "the timing designation is not the entries'",
+        ));
+    }
+    // 6. The game.
+    let game =
+        session::exactly_one(event, "game").ok_or(NonConforming::new(K, "not exactly one game"))?;
+    if game != a.game || game != b.game {
+        return Err(NonConforming::new(K, "the game is not the entries'"));
+    }
+    // 7. The variants: one per player, respecting both entries' roles.
+    if tags::count_named(event, "variant") != 2 {
+        return Err(NonConforming::new(K, "not exactly two variants"));
+    }
+    let variant_of =
+        |entry: &OpenChallenge, other: &OpenChallenge| -> Result<String, NonConforming> {
+            let variant = tags::variant_for(event, &entry.signer)
+                .filter(|v| session::is_identifier(v))
+                .ok_or(NonConforming::new(K, "no valid variant for a player"))?;
+            if entry.self_variant.as_deref().is_some_and(|v| v != variant) {
+                return Err(NonConforming::new(
+                    K,
+                    "a variant against the player's own term",
+                ));
+            }
+            if other
+                .opponent_variant
+                .as_deref()
+                .is_some_and(|v| v != variant)
+            {
+                return Err(NonConforming::new(
+                    K,
+                    "a variant against the other player's term",
+                ));
+            }
+            Ok(variant.to_owned())
+        };
+    let variant_a = variant_of(a, b)?;
+    let variant_b = variant_of(b, a)?;
+    let (first_variant, second_variant) = if first == a.signer {
+        (variant_a, variant_b)
+    } else {
+        (variant_b, variant_a)
+    };
+    // 8. The time control, identical to both entries' (presence and value).
+    let time_control = periods(event, K)?;
+    if time_control != a.time_control || time_control != b.time_control {
+        return Err(NonConforming::new(
+            K,
+            "the time control is not the entries'",
+        ));
+    }
+    // 9. The rules, the one both entries reference.
+    let rules = session::rules_ref(event)
+        .ok_or(NonConforming::new(K, "not exactly one rules reference"))?;
+    if rules != a.rules || rules != b.rules {
+        return Err(NonConforming::new(K, "the rules are not the entries'"));
+    }
+    // 11. Within both accept_until.
+    let created_at = event.created_at.as_secs();
+    if created_at > a.accept_until.min(b.accept_until) {
+        return Err(NonConforming::new(K, "after an entry's accept_until"));
+    }
+    // 13. Empty content.
+    if !event.content.is_empty() {
+        return Err(NonConforming::new(K, "content is not empty"));
+    }
+    // 14. found_until after created_at.
+    let found_until = session::exactly_one(event, "found_until")
+        .and_then(session::decimal)
+        .ok_or(NonConforming::new(K, "not exactly one valid found_until"))?;
+    if found_until <= created_at {
+        return Err(NonConforming::new(K, "found_until is not after created_at"));
+    }
+    Ok(Pairing {
+        id: event.id,
+        matchmaker,
+        created_at,
+        entries: [*ref_a, *ref_b],
+        first,
+        second,
+        first_variant,
+        second_variant,
+        game: game.to_owned(),
+        rules,
+        timing,
+        time_control,
+        found_until,
     })
 }
 
@@ -659,6 +1175,31 @@ pub fn mute_list(event: &Event) -> Result<Vec<PublicKey>, NonConforming> {
     p_tags(event, KIND_MUTE_LIST)
 }
 
+/// Reads a relay list (kind `10002`, NIP-65): the URL of every `r` tag, in
+/// tag order, whatever its marker.
+///
+/// # Errors
+///
+/// Not a kind `10002`, or an `r` tag without a URL.
+pub fn relay_list(event: &Event) -> Result<Vec<String>, NonConforming> {
+    accept(event, KIND_RELAY_LIST)?;
+    event
+        .tags
+        .iter()
+        .map(Tag::as_slice)
+        .filter(|s| s.first().map(String::as_str) == Some("r"))
+        .map(|s| {
+            s.get(1)
+                .filter(|url| !url.is_empty())
+                .cloned()
+                .ok_or(NonConforming::new(
+                    KIND_RELAY_LIST,
+                    "an r tag without a URL",
+                ))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -1038,5 +1579,561 @@ mod tests {
         let mutes = signed(&keys, 10000, vec![tag(&["p", &a.to_hex()])], "");
         assert_eq!(mute_list(&mutes).unwrap(), vec![a]);
         assert!(mute_list(&signed(&keys, 10000, vec![tag(&["p", "zz"])], "")).is_err());
+    }
+
+    // ---- 3418 and 3419 ----
+
+    fn entry_tags(matchmaker: &PublicKey) -> Vec<Tag> {
+        vec![
+            tag(&[
+                "p",
+                &matchmaker.to_hex(),
+                "wss://relay.sanki.app",
+                "matchmaker",
+            ]),
+            tag(&["timing_relay", "wss://relay.sanki.app"]),
+            tag(&["game", "sanki"]),
+            tag(&["e", &"7".repeat(64), "", "rules"]),
+            tag(&["time_control", "180", "2"]),
+            tag(&["accept_until", "1700000060"]),
+            tag(&["nonce", "0", "0"]),
+        ]
+    }
+
+    fn entry(keys: &Keys, matchmaker: &PublicKey, extra: &[Tag]) -> Event {
+        let mut tags = entry_tags(matchmaker);
+        tags.extend(extra.iter().cloned());
+        signed(keys, 3418, tags, "")
+    }
+
+    #[test]
+    fn reads_an_open_challenge() {
+        let alice = Keys::generate();
+        let matchmaker = Keys::generate().public_key();
+        let event = entry(
+            &alice,
+            &matchmaker,
+            &[
+                tag(&["variant", "self", "ogi"]),
+                tag(&["variant", "opponent", "ogi"]),
+                tag(&["filter", "following"]),
+            ],
+        );
+        let o = open_challenge(&event).unwrap();
+        assert_eq!(o.signer, alice.public_key());
+        assert_eq!(o.matchmaker, matchmaker);
+        assert_eq!(o.self_variant.as_deref(), Some("ogi"));
+        assert_eq!(o.opponent_variant.as_deref(), Some("ogi"));
+        assert_eq!(o.filter, Filter::Following);
+        assert_eq!(o.accept_until, 1_700_000_060);
+        assert_eq!(o.time_control, vec![[Some(180), Some(2), None]]);
+        assert_eq!(o.rows, vec![vec!["180", "2"]]);
+        // Open on both roles, no filter: everyone.
+        let open = open_challenge(&entry(&alice, &matchmaker, &[])).unwrap();
+        assert_eq!((open.self_variant, open.opponent_variant), (None, None));
+        assert_eq!(open.filter, Filter::Everyone);
+        // A rating filter, whole.
+        let authority = Keys::generate().public_key();
+        let rated = entry(
+            &alice,
+            &matchmaker,
+            &[tag(&[
+                "filter",
+                "rating",
+                "200",
+                &authority.to_hex(),
+                "3426",
+                "pergame",
+            ])],
+        );
+        assert_eq!(
+            open_challenge(&rated).unwrap().filter,
+            Filter::Rating {
+                max_delta: 200,
+                authority,
+                kind: 3426,
+                scope: RatingScope::PerGame
+            }
+        );
+    }
+
+    #[test]
+    fn refuses_a_non_conforming_open_challenge() {
+        let alice = Keys::generate();
+        let matchmaker = Keys::generate().public_key();
+        let base = entry_tags(&matchmaker);
+        let without = |name: &str| -> Vec<Tag> {
+            base.iter()
+                .filter(|t| t.as_slice()[0] != name)
+                .cloned()
+                .collect()
+        };
+        let with = |extra: &[Tag]| -> Vec<Tag> {
+            base.iter().cloned().chain(extra.iter().cloned()).collect()
+        };
+        let cases: Vec<(Vec<Tag>, &str, &str)> = vec![
+            (without("p"), "", "not exactly one matchmaker"),
+            (
+                with(&[tag(&[
+                    "p",
+                    &Keys::generate().public_key().to_hex(),
+                    "",
+                    "matchmaker",
+                ])]),
+                "",
+                "not exactly one matchmaker",
+            ),
+            (
+                with(&[tag(&["p", &Keys::generate().public_key().to_hex(), ""])]),
+                "",
+                "a p tag without a role marker",
+            ),
+            (
+                without("p")
+                    .into_iter()
+                    .chain([tag(&["p", &alice.public_key().to_hex(), "", "matchmaker"])])
+                    .collect(),
+                "",
+                "a p tag names the signer",
+            ),
+            (
+                without("timing_relay"),
+                "",
+                "not exactly one timing designation",
+            ),
+            (
+                with(&[tag(&[
+                    "p",
+                    &Keys::generate().public_key().to_hex(),
+                    "",
+                    "timestamper",
+                ])]),
+                "",
+                "not exactly one timing designation",
+            ),
+            (without("game"), "", "not exactly one valid game"),
+            (
+                with(&[tag(&["variant", "self", "Ogi"])]),
+                "",
+                "invalid variant identifier",
+            ),
+            (
+                with(&[tag(&["variant", "me", "ogi"])]),
+                "",
+                "a variant role outside self and opponent",
+            ),
+            (
+                with(&[
+                    tag(&["variant", "self", "ogi"]),
+                    tag(&["variant", "self", "chess"]),
+                ]),
+                "",
+                "two variants for one role",
+            ),
+            (without("time_control"), "", "malformed time_control"),
+            (with(&[tag(&["filter", "nobody"])]), "", "malformed filter"),
+            (
+                with(&[tag(&[
+                    "filter",
+                    "rating",
+                    "0",
+                    &"a".repeat(64),
+                    "3426",
+                    "pergame",
+                ])]),
+                "",
+                "max_delta outside 1 to 1000",
+            ),
+            (
+                with(&[tag(&[
+                    "filter",
+                    "rating",
+                    "1001",
+                    &"a".repeat(64),
+                    "3426",
+                    "pergame",
+                ])]),
+                "",
+                "max_delta outside 1 to 1000",
+            ),
+            (
+                with(&[tag(&["filter", "rating", "200", "nope", "3426", "pergame"])]),
+                "",
+                "malformed rating authority",
+            ),
+            (
+                with(&[tag(&[
+                    "filter",
+                    "rating",
+                    "200",
+                    &"a".repeat(64),
+                    "3425",
+                    "pergame",
+                ])]),
+                "",
+                "a rating kind outside 3426 and 3427",
+            ),
+            (
+                with(&[tag(&[
+                    "filter",
+                    "rating",
+                    "200",
+                    &"a".repeat(64),
+                    "3426",
+                    "global",
+                ])]),
+                "",
+                "a pool scope outside pergame and pervariant",
+            ),
+            (
+                with(&[tag(&["filter", "rating", "200", &"a".repeat(64), "3426"])]),
+                "",
+                "malformed filter",
+            ),
+            (
+                without("accept_until"),
+                "",
+                "not exactly one valid accept_until",
+            ),
+            (
+                without("accept_until")
+                    .into_iter()
+                    .chain([tag(&["accept_until", "1700000000"])])
+                    .collect(),
+                "",
+                "accept_until is not after created_at",
+            ),
+            (without("nonce"), "", "no honoured nonce"),
+            (base.clone(), "hello", "content is not empty"),
+            (
+                with(&[tag(&["expiration", "1700009999"])]),
+                "",
+                "an expiration tag",
+            ),
+            (without("e"), "", "not exactly one rules reference"),
+            (
+                with(&[tag(&["e", &"8".repeat(64), "", "reply"])]),
+                "",
+                "an e tag besides the rules reference",
+            ),
+            (
+                without("e")
+                    .into_iter()
+                    .chain([tag(&["e", &"A".repeat(64), "", "rules"])])
+                    .collect(),
+                "",
+                "not exactly one rules reference",
+            ),
+            (
+                with(&[tag(&[
+                    "filter",
+                    "rating",
+                    "+200",
+                    &"a".repeat(64),
+                    "3426",
+                    "pergame",
+                ])]),
+                "",
+                "max_delta outside 1 to 1000",
+            ),
+            (
+                with(&[tag(&[
+                    "filter",
+                    "rating",
+                    "200",
+                    &"A".repeat(64),
+                    "3426",
+                    "pergame",
+                ])]),
+                "",
+                "malformed rating authority",
+            ),
+        ];
+        for (tags, content, reason) in cases {
+            let event = signed(&alice, 3418, tags, content);
+            assert_eq!(open_challenge(&event).unwrap_err().reason, reason);
+        }
+        assert_eq!(
+            open_challenge(&signed(&alice, 3420, base, ""))
+                .unwrap_err()
+                .reason,
+            "another kind"
+        );
+    }
+
+    /// Two mirror entries, the matchmaker, and a conforming Pairing's tags.
+    fn paired() -> (Keys, OpenChallenge, OpenChallenge, Vec<Tag>) {
+        let matchmaker = Keys::generate();
+        let alice = Keys::generate();
+        let bob = Keys::generate();
+        let mirror = [
+            tag(&["variant", "self", "ogi"]),
+            tag(&["variant", "opponent", "ogi"]),
+        ];
+        let a = open_challenge(&entry(&alice, &matchmaker.public_key(), &mirror)).unwrap();
+        let b = open_challenge(&entry(&bob, &matchmaker.public_key(), &mirror)).unwrap();
+        let tags = vec![
+            tag(&["e", &a.id.to_hex(), "", "open_challenge"]),
+            tag(&["e", &b.id.to_hex(), "", "open_challenge"]),
+            tag(&["p", &alice.public_key().to_hex(), "", "player"]),
+            tag(&["p", &bob.public_key().to_hex(), "", "player"]),
+            tag(&["timing_relay", "wss://relay.sanki.app"]),
+            tag(&["game", "sanki"]),
+            tag(&["e", &"7".repeat(64), "", "rules"]),
+            tag(&["variant", &alice.public_key().to_hex(), "ogi"]),
+            tag(&["variant", &bob.public_key().to_hex(), "ogi"]),
+            tag(&["seat", &bob.public_key().to_hex(), "first"]),
+            tag(&["seat", &alice.public_key().to_hex(), "second"]),
+            tag(&["time_control", "180", "2"]),
+            tag(&["found_until", "1700000120"]),
+        ];
+        (matchmaker, a, b, tags)
+    }
+
+    #[test]
+    fn reads_a_pairing_against_its_entries() {
+        let (matchmaker, a, b, tags) = paired();
+        let event = signed(&matchmaker, 3419, tags, "");
+        let p = pairing(&event, [&a, &b]).unwrap();
+        assert_eq!(p.matchmaker, matchmaker.public_key());
+        assert_eq!(p.entries, [a.id, b.id]);
+        assert_eq!((p.first, p.second), (b.signer, a.signer));
+        assert_eq!(
+            (p.first_variant.as_str(), p.second_variant.as_str()),
+            ("ogi", "ogi")
+        );
+        assert_eq!(p.found_until, 1_700_000_120);
+        assert_eq!(p.time_control, a.time_control);
+        assert_eq!(p.opponent_of(&a.signer), Some(b.signer));
+        assert_eq!(p.variant_of(&b.signer), Some("ogi"));
+        // The entries in the other order read the same.
+        assert_eq!(pairing(&event, [&b, &a]).unwrap(), p);
+    }
+
+    #[test]
+    fn refuses_a_pairing_outside_its_entries_consent() {
+        let (matchmaker, a, b, base) = paired();
+        let without = |name: &str, value: &str| -> Vec<Tag> {
+            base.iter()
+                .filter(|t| !(t.as_slice()[0] == name && t.as_slice().iter().any(|v| v == value)))
+                .cloned()
+                .collect()
+        };
+        let replace = |name: &str, value: &str, new: Tag| -> Vec<Tag> {
+            without(name, value).into_iter().chain([new]).collect()
+        };
+        let stranger = Keys::generate().public_key();
+        let cases: Vec<(Vec<Tag>, &str, &str)> = vec![
+            (
+                without("e", "open_challenge"),
+                "",
+                "not exactly two open_challenge references",
+            ),
+            (
+                replace(
+                    "e",
+                    &a.id.to_hex(),
+                    tag(&["e", &"9".repeat(64), "", "open_challenge"]),
+                ),
+                "",
+                "the references are not the two entries",
+            ),
+            (
+                base.iter()
+                    .cloned()
+                    .chain([tag(&["e", &"8".repeat(64), "", "reply"])])
+                    .collect(),
+                "",
+                "an e tag besides the references",
+            ),
+            (
+                replace(
+                    "p",
+                    &a.signer.to_hex(),
+                    tag(&["p", &stranger.to_hex(), "", "player"]),
+                ),
+                "",
+                "the players are not the entries' signers",
+            ),
+            (
+                base.iter()
+                    .cloned()
+                    .chain([tag(&["p", &stranger.to_hex(), "", "arbiter"])])
+                    .collect(),
+                "",
+                "an arbiter",
+            ),
+            (
+                replace(
+                    "seat",
+                    "first",
+                    tag(&["seat", &b.signer.to_hex(), "second"]),
+                ),
+                "",
+                "the seats are not one first and one second",
+            ),
+            (
+                replace(
+                    "timing_relay",
+                    "wss://relay.sanki.app",
+                    tag(&["timing_relay", "wss://other.example"]),
+                ),
+                "",
+                "the timing designation is not the entries'",
+            ),
+            (
+                replace("game", "sanki", tag(&["game", "other"])),
+                "",
+                "the game is not the entries'",
+            ),
+            (
+                replace(
+                    "variant",
+                    &a.signer.to_hex(),
+                    tag(&["variant", &a.signer.to_hex(), "chess"]),
+                ),
+                "",
+                "a variant against the player's own term",
+            ),
+            (
+                replace("time_control", "180", tag(&["time_control", "180"])),
+                "",
+                "the time control is not the entries'",
+            ),
+            (
+                replace(
+                    "e",
+                    &"7".repeat(64),
+                    tag(&["e", &"6".repeat(64), "", "rules"]),
+                ),
+                "",
+                "the rules are not the entries'",
+            ),
+            (base.clone(), "x", "content is not empty"),
+            (
+                without("found_until", "1700000120"),
+                "",
+                "not exactly one valid found_until",
+            ),
+            (
+                replace(
+                    "found_until",
+                    "1700000120",
+                    tag(&["found_until", "1700000000"]),
+                ),
+                "",
+                "found_until is not after created_at",
+            ),
+        ];
+        for (tags, content, reason) in cases {
+            let event = signed(&matchmaker, 3419, tags, content);
+            assert_eq!(
+                pairing(&event, [&a, &b]).unwrap_err().reason,
+                reason,
+                "{reason}"
+            );
+        }
+        // Not the entries' matchmaker.
+        let other = Keys::generate();
+        let event = signed(&other, 3419, base.clone(), "");
+        assert_eq!(
+            pairing(&event, [&a, &b]).unwrap_err().reason,
+            "not signed by the entries' matchmaker"
+        );
+        // After an entry's accept_until (1700000060): stamped at 1700000061.
+        let late = EventBuilder::new(Kind::Custom(3419), "")
+            .tags(base.clone())
+            .custom_created_at(Timestamp::from(1_700_000_061))
+            .finalize(&matchmaker)
+            .unwrap();
+        assert_eq!(
+            pairing(&late, [&a, &b]).unwrap_err().reason,
+            "after an entry's accept_until"
+        );
+        // The matchmaker as a player: an entry designating a player as matchmaker
+        // cannot exist (rule: a p tag names the signer), so the check is on the
+        // Pairing's signer being one of the signers — the entries' matchmaker
+        // is a third key here, hence "not signed by the entries' matchmaker".
+        // A variant against the OTHER player's term.
+        let mut c = a.clone();
+        c.opponent_variant = Some("chess".to_owned());
+        let event = signed(&matchmaker, 3419, base.clone(), "");
+        assert_eq!(
+            pairing(&event, [&c, &b]).unwrap_err().reason,
+            "a variant against the other player's term"
+        );
+        // Entries with different timing designations cannot pair.
+        let mut d = b.clone();
+        d.timing = Timing::SelfTimed("wss://other.example".to_owned());
+        assert_eq!(
+            pairing(&event, [&a, &d]).unwrap_err().reason,
+            "the entries' timing designations differ"
+        );
+    }
+
+    #[test]
+    fn a_pairing_resolves_what_the_entries_left_open() {
+        // Bob fixed self = ogi, Dana fixed self = chess, both opponents open:
+        // a multi-variant Pairing conforms; one that swaps them does not.
+        let matchmaker = Keys::generate();
+        let bob = Keys::generate();
+        let dana = Keys::generate();
+        let b = open_challenge(&entry(
+            &bob,
+            &matchmaker.public_key(),
+            &[tag(&["variant", "self", "ogi"])],
+        ))
+        .unwrap();
+        let d = open_challenge(&entry(
+            &dana,
+            &matchmaker.public_key(),
+            &[tag(&["variant", "self", "chess"])],
+        ))
+        .unwrap();
+        let tags = |bv: &str, dv: &str| -> Vec<Tag> {
+            vec![
+                tag(&["e", &b.id.to_hex(), "", "open_challenge"]),
+                tag(&["e", &d.id.to_hex(), "", "open_challenge"]),
+                tag(&["p", &bob.public_key().to_hex(), "", "player"]),
+                tag(&["p", &dana.public_key().to_hex(), "", "player"]),
+                tag(&["timing_relay", "wss://relay.sanki.app"]),
+                tag(&["game", "sanki"]),
+                tag(&["e", &"7".repeat(64), "", "rules"]),
+                tag(&["variant", &bob.public_key().to_hex(), bv]),
+                tag(&["variant", &dana.public_key().to_hex(), dv]),
+                tag(&["seat", &bob.public_key().to_hex(), "first"]),
+                tag(&["seat", &dana.public_key().to_hex(), "second"]),
+                tag(&["time_control", "180", "2"]),
+                tag(&["found_until", "1700000120"]),
+            ]
+        };
+        let good = signed(&matchmaker, 3419, tags("ogi", "chess"), "");
+        let p = pairing(&good, [&b, &d]).unwrap();
+        assert_eq!(
+            (p.first_variant.as_str(), p.second_variant.as_str()),
+            ("ogi", "chess")
+        );
+        let bad = signed(&matchmaker, 3419, tags("chess", "ogi"), "");
+        assert!(pairing(&bad, [&b, &d]).is_err());
+    }
+
+    #[test]
+    fn reads_a_relay_list() {
+        let keys = Keys::generate();
+        let list = signed(
+            &keys,
+            10002,
+            vec![
+                tag(&["r", "wss://relay.sanki.app"]),
+                tag(&["r", "wss://purplepag.es", "write"]),
+            ],
+            "",
+        );
+        assert_eq!(
+            relay_list(&list).unwrap(),
+            vec!["wss://relay.sanki.app", "wss://purplepag.es"]
+        );
+        assert!(relay_list(&signed(&keys, 10002, vec![tag(&["r", ""])], "")).is_err());
+        assert!(relay_list(&signed(&keys, 10000, vec![], "")).is_err());
     }
 }

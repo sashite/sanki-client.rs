@@ -4,8 +4,8 @@
 //! and its type fixes three properties the bot cannot get wrong:
 //!
 //! - **its window**, in relay seconds: `not_before` and `not_after`;
-//! - **its proof of work**: kinds `3420`, `3423` and `3425` carry exactly
-//!   one `nonce` tag, mined to the relay's advertised minimum — at `0`, the
+//! - **its proof of work**: kinds `3418`, `3420`, `3423` and `3425` carry
+//!   exactly one `nonce` tag, mined to the relay's advertised minimum — at `0`, the
 //!   tag is `["nonce","0","0"]`, since the kinds require it; kind `3422`
 //!   and the standing events carry none;
 //! - **its convergence** — what re-signing is allowed:
@@ -14,8 +14,8 @@
 //! |---|---|---|
 //! | `Collapses` | Ply | at any time within the window, with the same content: identical candidates are one |
 //! | `EarliestWins` | Game Session, Conclusion | only once the previous signature is proven absent |
-//! | `Replaceable` | `0`, `3`, `10000`, `30420` | at any time; the stamp is monotone per coordinate |
-//! | `NotIdempotent` | Direct Challenge | never: a challenge whose outcome is `Unknown` is resolved by id before another is sent to the same target |
+//! | `Replaceable` | `0`, `3`, `10000`, `10002`, `30420` | at any time; the stamp is monotone per coordinate |
+//! | `NotIdempotent` | Direct Challenge, Open Challenge | never: a challenge whose outcome is `Unknown` is resolved by id before another is sent (two live entries are two Pairings) |
 //!
 //! A draft is a **function of its stamp**: [`Publishable::at`] gives the
 //! tags and content for a `created_at`, or withholds the event — `Expired`
@@ -33,8 +33,12 @@ use std::num::NonZeroU64;
 use nostr_sdk::prelude::*;
 
 use crate::module::Verdict;
-use crate::readers::{Founding, PolicyMode, KIND_CHALLENGE_POLICY, KIND_MUTE_LIST};
-use crate::session::{KIND_CONCLUSION, KIND_DIRECT_CHALLENGE, KIND_GAME_SESSION, KIND_PLY};
+use crate::readers::{
+    Filter, Founding, PolicyMode, KIND_CHALLENGE_POLICY, KIND_MUTE_LIST, KIND_RELAY_LIST,
+};
+use crate::session::{
+    KIND_CONCLUSION, KIND_DIRECT_CHALLENGE, KIND_GAME_SESSION, KIND_OPEN_CHALLENGE, KIND_PLY,
+};
 
 mod sealed {
     pub trait Sealed {}
@@ -442,11 +446,32 @@ impl Publishable for DirectChallenge {
             Tag::custom("variant", [self.me.to_hex(), self.variant.clone()]),
             Tag::custom("variant", [self.target.to_hex(), self.variant.clone()]),
         ];
-        if self.time_control.is_empty() || !crate::readers::challenge_content_ok(&self.content) {
+        if !crate::readers::challenge_content_ok(&self.content) {
             return Err(Withheld::Malformed);
         }
-        for period in &self.time_control {
-            // Positional: a hole would shift the elements' meaning.
+        tags.extend(time_control_tags(&self.time_control)?);
+        tags.push(Tag::custom(
+            "accept_until",
+            [stamp.saturating_add(self.accept_secs.get()).to_string()],
+        ));
+        Ok(Parts {
+            tags,
+            content: self.content.clone(),
+        })
+    }
+}
+
+// ---- Open Challenge ----
+
+/// The rows of a time control as the founding kinds write them, positional
+/// (a hole would shift the elements' meaning).
+fn time_control_tags(time_control: &[[Option<u64>; 3]]) -> Result<Vec<Tag>, Withheld> {
+    if time_control.is_empty() {
+        return Err(Withheld::Malformed);
+    }
+    time_control
+        .iter()
+        .map(|period| {
             let values: Vec<String> = match period {
                 [Some(d), None, None] if *d > 0 => vec![d.to_string()],
                 [Some(d), Some(i), None] if *d > 0 => vec![d.to_string(), i.to_string()],
@@ -455,15 +480,100 @@ impl Publishable for DirectChallenge {
                 }
                 _ => return Err(Withheld::Malformed),
             };
-            tags.push(Tag::custom("time_control", values));
+            Ok(Tag::custom("time_control", values))
+        })
+        .collect()
+}
+
+/// A pool entry (kind `3418`) in the **mirror** form (ADR-0047 §1): both
+/// roles fixed to `variant`, the time control the courted entry's, the
+/// filter the bot's own policy, `accept_until` an absolute instant (the
+/// courted entry's, at most two minutes ahead).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenChallenge {
+    /// The matchmaker.
+    pub matchmaker: PublicKey,
+    /// The timing relay.
+    pub timing_relay: String,
+    /// The game.
+    pub game: String,
+    /// The Rule System event.
+    pub rules: EventId,
+    /// The variant, for both roles.
+    pub variant: String,
+    /// The periods, as kind `3420` writes them.
+    pub time_control: Vec<[Option<u64>; 3]>,
+    /// The filter; `Everyone` writes no tag.
+    pub filter: Filter,
+    /// `accept_until`, absolute: the entry is withheld at or after it.
+    pub accept_until: u64,
+    /// The latest stamp, before `accept_until` by the lead the pairing needs.
+    pub not_after: u64,
+}
+
+impl sealed::Sealed for OpenChallenge {}
+
+impl Publishable for OpenChallenge {
+    fn name(&self) -> &'static str {
+        "open challenge"
+    }
+    fn kind(&self) -> Kind {
+        Kind::Custom(KIND_OPEN_CHALLENGE)
+    }
+    fn window(&self) -> Window {
+        Window {
+            not_before: None,
+            not_after: Some(self.not_after.min(self.accept_until.saturating_sub(1))),
         }
-        tags.push(Tag::custom(
-            "accept_until",
-            [stamp.saturating_add(self.accept_secs.get()).to_string()],
-        ));
+    }
+    fn mined(&self) -> bool {
+        true
+    }
+    fn convergence(&self) -> Convergence {
+        Convergence::NotIdempotent
+    }
+    fn may_take_reserve(&self) -> bool {
+        false
+    }
+    fn at(&self, stamp: u64, relay: &str) -> Result<Parts, Withheld> {
+        expired_unless(self.window(), stamp)?;
+        let mut tags = vec![
+            p_role(&self.matchmaker, relay, "matchmaker"),
+            Tag::custom("timing_relay", [self.timing_relay.clone()]),
+            Tag::custom("game", [self.game.clone()]),
+            e_marked(&self.rules, relay, "rules"),
+            Tag::custom("variant", ["self".to_owned(), self.variant.clone()]),
+            Tag::custom("variant", ["opponent".to_owned(), self.variant.clone()]),
+        ];
+        tags.extend(time_control_tags(&self.time_control)?);
+        match self.filter {
+            Filter::Everyone => {}
+            Filter::Following => tags.push(Tag::custom("filter", ["following"])),
+            Filter::Rating {
+                max_delta,
+                authority,
+                kind,
+                scope,
+            } => {
+                if !(1..=1000).contains(&max_delta) || !(kind == 3426 || kind == 3427) {
+                    return Err(Withheld::Malformed);
+                }
+                tags.push(Tag::custom(
+                    "filter",
+                    [
+                        "rating".to_owned(),
+                        max_delta.to_string(),
+                        authority.to_hex(),
+                        kind.to_string(),
+                        scope.token().to_owned(),
+                    ],
+                ));
+            }
+        }
+        tags.push(Tag::custom("accept_until", [self.accept_until.to_string()]));
         Ok(Parts {
             tags,
-            content: self.content.clone(),
+            content: String::new(),
         })
     }
 }
@@ -584,6 +694,47 @@ impl Publishable for MuteList {
                 .0
                 .iter()
                 .map(|p| Tag::custom("p", [p.to_hex()]))
+                .collect(),
+            content: String::new(),
+        })
+    }
+}
+
+/// The relay list (kind `10002`, NIP-65): one `r` tag per relay, in order,
+/// read and write alike (no marker).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayList(pub Vec<String>);
+
+impl sealed::Sealed for RelayList {}
+
+impl Publishable for RelayList {
+    fn name(&self) -> &'static str {
+        "relay list"
+    }
+    fn kind(&self) -> Kind {
+        Kind::Custom(KIND_RELAY_LIST)
+    }
+    fn window(&self) -> Window {
+        Window::default()
+    }
+    fn mined(&self) -> bool {
+        false
+    }
+    fn convergence(&self) -> Convergence {
+        Convergence::Replaceable
+    }
+    fn may_take_reserve(&self) -> bool {
+        false
+    }
+    fn at(&self, _stamp: u64, _relay: &str) -> Result<Parts, Withheld> {
+        if self.0.iter().any(|url| !url.starts_with("wss://")) {
+            return Err(Withheld::Malformed);
+        }
+        Ok(Parts {
+            tags: self
+                .0
+                .iter()
+                .map(|url| Tag::custom("r", [url.clone()]))
                 .collect(),
             content: String::new(),
         })
@@ -726,6 +877,7 @@ mod tests {
 
     use super::*;
     use crate::module::SeatResult;
+    use crate::readers::RatingScope;
 
     fn id(byte: u8) -> EventId {
         EventId::from_slice(&[byte; 32]).unwrap()
@@ -862,5 +1014,114 @@ mod tests {
             policy: Policy::Rating { max_delta: 5000 },
         };
         assert_eq!(wild.at(1, ""), Err(Withheld::Malformed));
+    }
+
+    #[test]
+    fn an_open_challenge_mirrors_and_expires_before_its_deadline() {
+        let matchmaker = Keys::generate().public_key();
+        let entry = OpenChallenge {
+            matchmaker,
+            timing_relay: "wss://relay.sanki.app".to_owned(),
+            game: "sanki".to_owned(),
+            rules: id(7),
+            variant: "ogi".to_owned(),
+            time_control: vec![[Some(0), Some(10), Some(1)]],
+            filter: Filter::Everyone,
+            accept_until: 600,
+            not_after: 590,
+        };
+        let parts = entry.at(400, "wss://relay.sanki.app").unwrap();
+        let slices: Vec<Vec<String>> = parts.tags.iter().map(|t| t.as_slice().to_vec()).collect();
+        assert!(slices.contains(&vec![
+            "p".to_owned(),
+            matchmaker.to_hex(),
+            "wss://relay.sanki.app".to_owned(),
+            "matchmaker".to_owned()
+        ]));
+        assert!(slices.contains(&vec![
+            "variant".to_owned(),
+            "self".to_owned(),
+            "ogi".to_owned()
+        ]));
+        assert!(slices.contains(&vec![
+            "variant".to_owned(),
+            "opponent".to_owned(),
+            "ogi".to_owned()
+        ]));
+        assert!(slices.contains(&vec![
+            "time_control".to_owned(),
+            "0".to_owned(),
+            "10".to_owned(),
+            "1".to_owned()
+        ]));
+        assert!(slices.contains(&vec!["accept_until".to_owned(), "600".to_owned()]));
+        assert!(!slices.iter().any(|t| t[0] == "filter"));
+        assert!(parts.content.is_empty());
+        assert_eq!(entry.window().not_after, Some(590));
+        assert_eq!(entry.at(591, "wss://r"), Err(Withheld::Expired));
+        assert!(entry.mined());
+        assert!(!entry.may_take_reserve());
+        assert_eq!(entry.convergence(), Convergence::NotIdempotent);
+        // The window never reaches accept_until itself.
+        let mut late = entry.clone();
+        late.not_after = 700;
+        assert_eq!(late.window().not_after, Some(599));
+        // The filters.
+        let mut following = entry.clone();
+        following.filter = Filter::Following;
+        let parts = following.at(400, "wss://r").unwrap();
+        assert!(parts
+            .tags
+            .iter()
+            .any(|t| t.as_slice() == ["filter", "following"]));
+        let authority = Keys::generate().public_key();
+        let mut rated = entry.clone();
+        rated.filter = Filter::Rating {
+            max_delta: 200,
+            authority,
+            kind: 3426,
+            scope: RatingScope::PerGame,
+        };
+        let parts = rated.at(400, "wss://r").unwrap();
+        assert!(parts.tags.iter().any(|t| {
+            t.as_slice()
+                == [
+                    "filter",
+                    "rating",
+                    "200",
+                    &authority.to_hex(),
+                    "3426",
+                    "pergame",
+                ]
+        }));
+        let mut wide = rated.clone();
+        wide.filter = Filter::Rating {
+            max_delta: 0,
+            authority,
+            kind: 3426,
+            scope: RatingScope::PerVariant,
+        };
+        assert_eq!(wide.at(400, "wss://r"), Err(Withheld::Malformed));
+        let mut hole = entry;
+        hole.time_control = vec![[Some(0), None, Some(1)]];
+        assert_eq!(hole.at(400, "wss://r"), Err(Withheld::Malformed));
+    }
+
+    #[test]
+    fn a_relay_list_names_its_relays_in_order() {
+        let list = RelayList(vec![
+            "wss://relay.sanki.app".to_owned(),
+            "wss://purplepag.es".to_owned(),
+        ]);
+        let parts = list.at(0, "wss://r").unwrap();
+        assert_eq!(parts.tags[0].as_slice(), ["r", "wss://relay.sanki.app"]);
+        assert_eq!(parts.tags[1].as_slice(), ["r", "wss://purplepag.es"]);
+        assert_eq!(list.convergence(), Convergence::Replaceable);
+        assert!(!list.mined());
+        assert!(!list.may_take_reserve());
+        assert_eq!(
+            RelayList(vec!["https://x".to_owned()]).at(0, "wss://r"),
+            Err(Withheld::Malformed)
+        );
     }
 }

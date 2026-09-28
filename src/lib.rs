@@ -12,8 +12,8 @@
 //! | [`notation`] | the Ply content ↔ canonical PMN converters, on `sashite_sanki_engine::pmn` (the oracle of notation only) |
 //! | [`clock`] | how many seconds a mover may still take (`max_affordable`) |
 //! | [`cadence`] | the cadence family of a time control (*Cadence — Sanki*) |
-//! | [`readers`] | typed readers of the suite's kinds (`3420`, `3422`, `3426`, `30420`, `0`, `3`, `10000`): the event, or the reason it does not conform |
-//! | [`drafts`] | the sealed drafts: a Ply, a Game Session, a Conclusion, a Direct Challenge, the standing events — each with its window, its proof of work and its convergence |
+//! | [`readers`] | typed readers of the suite's kinds (`3418`, `3419`, `3420`, `3422`, `3426`, `30420`, `0`, `3`, `10000`, `10002`): the event, or the reason it does not conform |
+//! | [`drafts`] | the sealed drafts: a Ply, a Game Session, a Conclusion, a Direct Challenge, an Open Challenge, the standing events — each with its window, its proof of work and its convergence |
 //! | [`publisher`] | one queue ordered by deadline, the token governor with its reserve, stamping without backdating, the outcomes and what each convergence does with `Unknown`, the lease |
 //! | [`query`] | a query the relay's EOSE proves: `Some(events)`, or `None` when nothing is proven |
 //! | [`relay`] | the relay's NIP-11 document, read as a self-timed client must |
