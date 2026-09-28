@@ -17,7 +17,9 @@
 //!   prescribe it, mined to a minimum;
 //! - `set_rate_limit` enforces the per-signer rate limit, with its wording;
 //! - `set_drop_acks` stores the next events without acknowledging them;
-//! - `set_silent` answers no REQ, so that a query proves nothing.
+//! - `set_silent` answers no REQ, so that a query proves nothing;
+//! - `set_store_delay` keeps an accepted event in transit for a while;
+//! - `rejected` lists every rejection answered, with its wording.
 //!
 //! Filter support is the subset a client uses: `ids`, `authors`, `kinds`,
 //! `#e` / `#p` (any single-letter tag), `since`, `until`. `limit` is ignored
@@ -106,6 +108,11 @@ pub struct RelayState {
     drop_acks: Mutex<u32>,
     /// Ignore every REQ: no events, no EOSE — a relay that does not answer.
     silent: Mutex<bool>,
+    /// Every rejection answered, as `(pubkey, kind, reason)`.
+    rejected: Mutex<Vec<(String, u64, String)>>,
+    /// A delay before an accepted event is stored, acknowledged and
+    /// delivered: an event in transit at a client's death.
+    store_delay: Mutex<Option<std::time::Duration>>,
     subscriptions: Mutex<Vec<Subscription>>,
 }
 
@@ -178,6 +185,17 @@ impl MiniRelay {
     /// Answer no REQ at all — neither events nor EOSE — or stop.
     pub async fn set_silent(&self, silent: bool) {
         *self.state.silent.lock().await = silent;
+    }
+
+    /// Store, acknowledge and deliver every accepted event only after
+    /// `delay`: an event in transit when its sender dies.
+    pub async fn set_store_delay(&self, delay: Option<std::time::Duration>) {
+        *self.state.store_delay.lock().await = delay;
+    }
+
+    /// Every rejection answered so far, as `(pubkey, kind, reason)`.
+    pub async fn rejected(&self) -> Vec<(String, u64, String)> {
+        self.state.rejected.lock().await.clone()
     }
 
     /// The NIP-11 document this relay would advertise for its current
@@ -334,8 +352,19 @@ async fn handle_publish(state: &Arc<RelayState>, event: Value, outbound: &Unboun
     // The policy: the strict window on the timed kinds, the proof of work
     // on the kinds that prescribe it — with the reference relay's wordings.
     if let Some(reason) = rejection(state, &event, kind).await {
+        state
+            .rejected
+            .lock()
+            .await
+            .push((pubkey.clone(), kind, reason.clone()));
         let _ = outbound.send(json!(["OK", id, false, reason]).to_string());
         return;
+    }
+    // The fault: the event is in transit for a while — stored, acknowledged
+    // and delivered only after the delay.
+    let delay = *state.store_delay.lock().await;
+    if let Some(delay) = delay {
+        tokio::time::sleep(delay).await;
     }
 
     // The fault: acknowledge, deliver to no one. The publisher believes the
@@ -481,7 +510,18 @@ fn leading_zero_bits(id_hex: &str) -> u32 {
 }
 
 async fn store_and_broadcast(state: &Arc<RelayState>, event: Value) {
-    state.stored.lock().await.push(event.clone());
+    {
+        // Once: a frame delayed in transit may be followed by its resend.
+        let mut stored = state.stored.lock().await;
+        let id = event.get("id").and_then(Value::as_str);
+        if stored
+            .iter()
+            .any(|e| e.get("id").and_then(Value::as_str) == id)
+        {
+            return;
+        }
+        stored.push(event.clone());
+    }
     let subscriptions = state.subscriptions.lock().await;
     for sub in subscriptions.iter() {
         if sub.filters.iter().any(|filter| matches(&event, filter)) {

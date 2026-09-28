@@ -4,7 +4,26 @@ All notable changes to this project are documented in this file. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.1] — 2026-09-28
+
+### Added
+
+- **The relay's clock, learnt exactly.** A timing rejection of the
+  reference relay states the relay's clock (`… (relay clock M, tolerance
+  Ts)`): the skew becomes `M − host`, `host` read as the event was sent —
+  `RelayClock::learn`, `publish::relay_clock_in` — instead of a two-second
+  step per rejection; the step remains for a relay that states nothing.
+  A stamp forced above the window by a draft's `not_before` waits for the
+  corrected clock rather than failing. The same on the resend of an
+  unacknowledged Ply that meets a timing verdict. A ±10 s skew now costs
+  one rejection, never a lost step.
+- `testing::MiniRelay::set_store_delay` — an accepted event kept in
+  transit for a while (stored, acknowledged and delivered after the
+  delay): a client's death with a Ply on the wire; `rejected()` — every
+  rejection answered, with its wording. The relay stores an event once
+  (a delayed frame followed by its resend).
+
+## [0.1.0] — 2026-09-28
 
 ### Added
 

@@ -886,6 +886,7 @@ where
             }
         };
         job.attempts = job.attempts.saturating_add(1);
+        let sent_at = Timestamp::now().as_secs();
         match self.send(&event).await {
             Sent::Accepted => {
                 self.record_replaceable(job.draft.as_ref(), stamp);
@@ -895,14 +896,23 @@ where
                 let rejection =
                     Rejection::classify(&reason, stamp, floor_now(&self.relay_clock), settings);
                 let retry = match &rejection {
+                    // A timing verdict: the relay's clock learnt exactly
+                    // when the reason states it, else the estimate moved
+                    // its way.
                     Rejection::Stale => {
-                        self.relay_clock.bump();
-                        tracing::debug!(draft = name, %reason, "stale stamp; re-stamping");
+                        match crate::publish::relay_clock_in(&reason) {
+                            Some(relay_now) => self.relay_clock.learn(relay_now, sent_at),
+                            None => self.relay_clock.bump(),
+                        }
+                        tracing::debug!(draft = name, %reason, skew = self.relay_clock.skew_secs(), "stale stamp; re-stamping");
                         true
                     }
                     Rejection::Future => {
-                        self.relay_clock.lower();
-                        tracing::debug!(draft = name, %reason, "future stamp; re-stamping");
+                        match crate::publish::relay_clock_in(&reason) {
+                            Some(relay_now) => self.relay_clock.learn(relay_now, sent_at),
+                            None => self.relay_clock.lower(),
+                        }
+                        tracing::debug!(draft = name, %reason, skew = self.relay_clock.skew_secs(), "future stamp; re-stamping");
                         true
                     }
                     Rejection::Pow => {
@@ -941,6 +951,7 @@ where
                         <= stamp.saturating_add(settings.past_tolerance);
                     if still_fresh && self.take_token_now(true) {
                         job.attempts = job.attempts.saturating_add(1);
+                        let resent_at = Timestamp::now().as_secs();
                         match self.send(&event).await {
                             Sent::Accepted => {
                                 let _ = job.reply.send(Outcome::Accepted(event));
@@ -957,7 +968,22 @@ where
                                     settings,
                                 );
                                 match rejection {
-                                    Rejection::Stale | Rejection::Future => self.enqueue(job),
+                                    Rejection::Stale | Rejection::Future => {
+                                        // The clock learnt here too, and the
+                                        // resend not counted against the
+                                        // re-stamps: it was the same event.
+                                        match crate::publish::relay_clock_in(&reason) {
+                                            Some(relay_now) => {
+                                                self.relay_clock.learn(relay_now, resent_at);
+                                            }
+                                            None if rejection == Rejection::Stale => {
+                                                self.relay_clock.bump();
+                                            }
+                                            None => self.relay_clock.lower(),
+                                        }
+                                        job.attempts = job.attempts.saturating_sub(1);
+                                        self.enqueue(job);
+                                    }
                                     other => {
                                         let _ = job.reply.send(Outcome::Rejected(other));
                                     }

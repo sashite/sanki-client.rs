@@ -7,8 +7,10 @@
 //! never blindly the local clock — and mined to the configured NIP-13
 //! difficulty. A rejection whose reason carries the `created_at` token means
 //! the stamp was stale: the event was never stored, carries no penalty, and
-//! is simply re-signed with a bumped `created_at` (raising the estimate for
-//! the next publish). Any other rejection is surfaced, never blind-retried.
+//! is simply re-signed with a corrected `created_at` — the relay's clock
+//! learnt exactly when the reason states it (the reference relay's `(relay
+//! clock M, tolerance Ts)`), else the estimate stepped its way. Any other
+//! rejection is surfaced, never blind-retried.
 
 use std::num::NonZeroU8;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -20,7 +22,8 @@ use nostr_sdk::prelude::*;
 /// any surplus is charged to the mover as elapsed time.
 const FORWARD_BUFFER_SECS: u64 = 1;
 
-/// Per-retry bump on a stale rejection (seconds).
+/// Per-retry step on a timing rejection whose reason does not state the
+/// relay's clock (seconds).
 const RETRY_BUMP_SECS: i64 = 2;
 
 /// Cap on the maintained skew estimate (seconds, either direction).
@@ -81,6 +84,35 @@ impl RelayClock {
                 Some(skew.saturating_sub(RETRY_BUMP_SECS).max(-MAX_SKEW_SECS))
             });
     }
+
+    /// Learn the relay's clock from a rejection that states it (the
+    /// reference relay's `(relay clock M, tolerance Ts)`): the skew is
+    /// `M − host`, exactly, within the cap — `host` being the host's clock
+    /// as read when the event was sent, so that the round trip does not
+    /// bias the estimate low.
+    pub(crate) fn learn(&self, relay_now: u64, host_at_send: u64) {
+        let host = i64::try_from(host_at_send).unwrap_or(i64::MAX);
+        let relay = i64::try_from(relay_now).unwrap_or(i64::MAX);
+        let skew = relay
+            .saturating_sub(host)
+            .clamp(-MAX_SKEW_SECS, MAX_SKEW_SECS);
+        self.skew_secs.store(skew, Ordering::Relaxed);
+    }
+
+    /// The learnt skew, in seconds (relay − host).
+    #[must_use]
+    pub fn skew_secs(&self) -> i64 {
+        self.skew_secs.load(Ordering::Relaxed)
+    }
+}
+
+/// The relay's clock, when a timing rejection states it: the reference
+/// relay writes `(relay clock M, tolerance Ts)`.
+#[must_use]
+pub fn relay_clock_in(reason: &str) -> Option<u64> {
+    let (_, rest) = reason.split_once("relay clock ")?;
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
 }
 
 /// Whether a relay rejection reason denotes a STALE `created_at` (the strict
@@ -175,6 +207,7 @@ where
         // relay accepted the event: a relay's `OK false` is in `failed`, keyed
         // by relay, with the relay's message verbatim. An `Err` is a send that
         // could not start (no relay, a shut-down client).
+        let sent_at = Timestamp::now().as_secs();
         let output = client
             .send_event(&event)
             .await
@@ -189,12 +222,18 @@ where
             .cloned()
             .unwrap_or_else(|| "no relay answered".to_owned());
         if is_stale_reason(&reason) {
-            relay_clock.bump();
+            match relay_clock_in(&reason) {
+                Some(relay_now) => relay_clock.learn(relay_now, sent_at),
+                None => relay_clock.bump(),
+            }
             tracing::debug!(%reason, "stale created_at; re-signing with a bumped stamp");
             continue;
         }
         if is_future_reason(&reason) {
-            relay_clock.lower();
+            match relay_clock_in(&reason) {
+                Some(relay_now) => relay_clock.learn(relay_now, sent_at),
+                None => relay_clock.lower(),
+            }
             tracing::debug!(%reason, "future created_at; re-signing with a lowered stamp");
             continue;
         }
@@ -217,6 +256,28 @@ mod tests {
         // (non-conformingly) includes the token.
         assert!(is_future_reason("invalid: timestamp too far in the future"));
         assert!(!is_stale_reason("invalid: created_at too far ahead"));
+    }
+
+    #[test]
+    fn the_relay_clock_is_read_from_the_reference_wording() {
+        assert_eq!(
+            relay_clock_in(
+                "invalid: created_at 100 is in the past (relay clock 105, tolerance 1s)"
+            ),
+            Some(105)
+        );
+        assert_eq!(
+            relay_clock_in(
+                "invalid: timestamp 120 is too far in the future (relay clock 105, tolerance 5s)"
+            ),
+            Some(105)
+        );
+        assert_eq!(relay_clock_in("invalid: created_at is stale"), None);
+        let clock = RelayClock::new();
+        clock.learn(1_000, 1_003);
+        assert_eq!(clock.skew_secs(), -3);
+        clock.learn(1_000, 900);
+        assert_eq!(clock.skew_secs(), 60, "capped");
     }
 
     #[test]
