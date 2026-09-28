@@ -81,3 +81,59 @@ async fn the_eose_proves_the_answer_and_silence_proves_nothing() {
     let unknown = RelayUrl::parse("wss://nowhere.example.com").unwrap();
     assert_eq!(query(&client, &unknown, vec![], bound).await, None);
 }
+
+#[tokio::test]
+async fn a_cut_proves_nothing_and_the_restore_answers_again() {
+    let relay = MiniRelay::start().await;
+    let client = Client::builder().build();
+    // A short retry, so that the test does not wait for the default.
+    client
+        .add_relay(&relay.url)
+        .opts(RelayOptions::new().retry_interval(Duration::from_secs(1)))
+        .await
+        .unwrap();
+    client.connect().and_wait(Duration::from_secs(5)).await;
+    let url = RelayUrl::parse(&relay.url).unwrap();
+    let keys = Keys::generate();
+    let bound = Duration::from_secs(2);
+    let filter = Filter::new().author(keys.public_key()).kind(Kind::TextNote);
+    assert_eq!(
+        query(&client, &url, vec![filter.clone()], bound).await,
+        Some(Vec::new())
+    );
+
+    // The cut: the connection drops, and nothing is proven while it lasts.
+    relay.cut().await;
+    let note = EventBuilder::new(Kind::TextNote, "during the cut")
+        .finalize(&keys)
+        .unwrap();
+    relay
+        .inject(serde_json::from_str(&note.as_json()).unwrap())
+        .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let relay_handle = client.relay(&url).await.unwrap().unwrap();
+    assert!(
+        !relay_handle.status().is_connected(),
+        "the cut closed the socket"
+    );
+    assert_eq!(
+        query(&client, &url, vec![filter.clone()], bound).await,
+        None
+    );
+
+    // The restore: the client reconnects on its own, and the query answers
+    // what the relay stored during the cut.
+    relay.restore().await;
+    let mut answer = None;
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if !relay_handle.status().is_connected() {
+            continue;
+        }
+        answer = query(&client, &url, vec![filter.clone()], bound).await;
+        if answer.is_some() {
+            break;
+        }
+    }
+    assert_eq!(answer.map(|events| events.len()), Some(1));
+}

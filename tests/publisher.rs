@@ -12,6 +12,7 @@
 )]
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use nostr_sdk::prelude::*;
@@ -29,7 +30,12 @@ use sashite_sanki_client::testing::{MiniRelay, Window as RelayWindow};
 
 async fn connected(relay: &MiniRelay) -> Client {
     let client = Client::builder().build();
-    client.add_relay(&relay.url).await.unwrap();
+    // A short retry, for the cut below.
+    client
+        .add_relay(&relay.url)
+        .opts(RelayOptions::new().retry_interval(Duration::from_secs(1)))
+        .await
+        .unwrap();
     client.connect().and_wait(Duration::from_secs(5)).await;
     client
 }
@@ -393,4 +399,46 @@ async fn a_closed_publisher_answers_closed() {
     let now = publisher.now();
     publisher.close();
     assert_eq!(publisher.publish(ply(1, now)).await, Outcome::Closed);
+}
+
+#[tokio::test]
+async fn nothing_is_sent_while_the_relay_is_away() {
+    let relay = MiniRelay::start().await;
+    relay.set_window(Some(RelayWindow::REFERENCE)).await;
+    let publisher = Arc::new(open(&relay, Keys::generate(), 30, 0).await);
+    let now = publisher.now();
+    let Outcome::Accepted(_) = publisher.publish(ply(1, now)).await else {
+        panic!()
+    };
+
+    // The cut: a Ply waits in the queue — not signed, not queued in the
+    // client to be flushed stale at the reconnection — and one whose
+    // window closes meanwhile is withheld.
+    relay.cut().await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let waiting = {
+        let publisher = Arc::clone(&publisher);
+        tokio::spawn(async move { publisher.publish(ply(2, now)).await })
+    };
+    let mut short = ply(3, now);
+    short.not_after = now + 2;
+    let Outcome::Withheld(Withheld::Expired) = publisher.publish(short).await else {
+        panic!()
+    };
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(!waiting.is_finished(), "the Ply waits for the relay");
+    assert_eq!(relay.received().await.len(), 1);
+
+    // Reconnected: the Ply is stamped now and accepted; nothing stale
+    // reached the relay, nothing was rejected.
+    relay.restore().await;
+    let Outcome::Accepted(event) = waiting.await.unwrap() else {
+        panic!()
+    };
+    assert!(
+        event.created_at.as_secs() >= now + 2,
+        "stamped at the reconnection"
+    );
+    assert_eq!(relay.received().await.len(), 2);
+    assert!(relay.rejected().await.is_empty());
 }

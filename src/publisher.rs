@@ -90,6 +90,9 @@ const MAX_UNKNOWN_SENDS: u32 = 4;
 /// The pause before a retry after `RateLimited`.
 const RATE_LIMITED_PAUSE: Duration = Duration::from_secs(2);
 
+/// How often the dispatcher looks again while the relay is away.
+const OFFLINE_POLL: Duration = Duration::from_secs(1);
+
 /// What the publisher needs to know.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
@@ -843,8 +846,33 @@ where
         }
     }
 
-    /// Sends a signed event; the relay's answer.
+    /// Whether the relay is **away**: the client lost its connection and
+    /// is coming back to it (disconnected, connecting, pending). A relay
+    /// the client gave up on — terminated, banned, shut down, or not in the
+    /// pool — is not away: a send fails there, and says so.
+    async fn away(&self) -> bool {
+        match self.client.relay(&self.settings.relay).await {
+            Ok(Some(relay)) => matches!(
+                relay.status(),
+                RelayStatus::Initialized
+                    | RelayStatus::Pending
+                    | RelayStatus::Connecting
+                    | RelayStatus::Disconnected
+                    | RelayStatus::Sleeping
+            ),
+            _ => false,
+        }
+    }
+
+    /// Sends a signed event; the relay's answer. Nothing is sent while the
+    /// relay is away (the dispatcher holds the queue then; this is the last
+    /// guard, against a loss between the choice and the send): the client
+    /// would queue the event and flush it at the reconnection, stale by
+    /// then.
     async fn send(&self, event: &Event) -> Sent {
+        if self.away().await {
+            return Sent::Offline;
+        }
         let output = self.client.send_event(event).ok_timeout(OK_TIMEOUT).await;
         match output {
             Ok(output) if !output.success.is_empty() => Sent::Accepted,
@@ -888,6 +916,13 @@ where
         job.attempts = job.attempts.saturating_add(1);
         let sent_at = Timestamp::now().as_secs();
         match self.send(&event).await {
+            Sent::Offline => {
+                // Not sent: back to the queue, the attempt not counted, for
+                // a fresh stamp once the relay is back.
+                job.attempts = job.attempts.saturating_sub(1);
+                job.not_before_instant = Instant::now().checked_add(OFFLINE_POLL);
+                self.enqueue(job);
+            }
             Sent::Accepted => {
                 self.record_replaceable(job.draft.as_ref(), stamp);
                 let _ = job.reply.send(Outcome::Accepted(event));
@@ -990,6 +1025,11 @@ where
                                 }
                             }
                             Sent::Unknown => self.enqueue(job),
+                            Sent::Offline => {
+                                job.attempts = job.attempts.saturating_sub(1);
+                                job.not_before_instant = Instant::now().checked_add(OFFLINE_POLL);
+                                self.enqueue(job);
+                            }
                         }
                     } else {
                         self.enqueue(job);
@@ -1069,6 +1109,8 @@ enum Sent {
     Accepted,
     Rejected(String),
     Unknown,
+    /// Not sent: the relay was away.
+    Offline,
 }
 
 /// What the dispatcher does next.
@@ -1096,7 +1138,12 @@ where
             }
             return;
         }
-        let next = choose(&inner);
+        // While the relay is away nothing is chosen: a draft waits in the
+        // queue for a fresh stamp at the reconnection — or expires there —
+        // rather than being signed for a send the client would queue and
+        // flush stale. The tokens are kept.
+        let away = inner.away().await;
+        let next = choose(&inner, away);
         match next {
             Next::Run(job) => {
                 tokio::spawn(Arc::clone(&inner).attempt(job));
@@ -1113,8 +1160,9 @@ where
 }
 
 /// The choice: among the jobs, ordered by `not_after` then arrival, the
-/// first whose `not_before` has come and for which a token is available.
-fn choose<S>(inner: &Inner<S>) -> Next {
+/// first whose `not_before` has come and for which a token is available —
+/// none while the relay is away, the expired ones answered still.
+fn choose<S>(inner: &Inner<S>, away: bool) -> Next {
     let now_secs = floor_now(&inner.relay_clock);
     let now = Instant::now();
     let mut queue = inner
@@ -1144,6 +1192,14 @@ fn choose<S>(inner: &Inner<S>) -> Next {
         } else {
             index = index.saturating_add(1);
         }
+    }
+
+    if away {
+        return if queue.is_empty() {
+            Next::Idle
+        } else {
+            Next::Wait(now.checked_add(OFFLINE_POLL).unwrap_or(now))
+        };
     }
 
     let mut order: Vec<usize> = (0..queue.len()).collect();

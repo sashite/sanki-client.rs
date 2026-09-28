@@ -19,6 +19,8 @@
 //! - `set_drop_acks` stores the next events without acknowledging them;
 //! - `set_silent` answers no REQ, so that a query proves nothing;
 //! - `set_store_delay` keeps an accepted event in transit for a while;
+//! - `cut` drops every connection and refuses new ones until `restore`: a
+//!   network cut, or — cut and restored at once — a relay restart;
 //! - `rejected` lists every rejection answered, with its wording.
 //!
 //! Filter support is the subset a client uses: `ids`, `authors`, `kinds`,
@@ -40,7 +42,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
-use tokio::sync::Mutex;
+use tokio::sync::{watch, Mutex};
 
 use crate::relay::{Limitation, RelayInfo};
 
@@ -90,7 +92,6 @@ struct Subscription {
 }
 
 /// The relay's shared state.
-#[derive(Default)]
 pub struct RelayState {
     stored: Mutex<Vec<Value>>,
     received: Mutex<Vec<ReceivedEvent>>,
@@ -114,6 +115,32 @@ pub struct RelayState {
     /// delivered: an event in transit at a client's death.
     store_delay: Mutex<Option<std::time::Duration>>,
     subscriptions: Mutex<Vec<Subscription>>,
+    /// Cut: no connection is accepted.
+    offline: Mutex<bool>,
+    /// Bumped at every cut; every connection watches it and closes.
+    cut: watch::Sender<u64>,
+}
+
+impl Default for RelayState {
+    fn default() -> Self {
+        Self {
+            stored: Mutex::default(),
+            received: Mutex::default(),
+            swallow_plies_from: Mutex::default(),
+            window: Mutex::default(),
+            skew: Mutex::default(),
+            min_pow: Mutex::default(),
+            rate_limit: Mutex::default(),
+            accepted: Mutex::default(),
+            drop_acks: Mutex::default(),
+            silent: Mutex::default(),
+            rejected: Mutex::default(),
+            store_delay: Mutex::default(),
+            subscriptions: Mutex::default(),
+            offline: Mutex::default(),
+            cut: watch::channel(0).0,
+        }
+    }
 }
 
 /// A running relay: its URL and its state.
@@ -139,6 +166,11 @@ impl MiniRelay {
                 let Ok((stream, _)) = listener.accept().await else {
                     break;
                 };
+                if *accept_state.offline.lock().await {
+                    // The cut: the connection is dropped before any handshake.
+                    drop(stream);
+                    continue;
+                }
                 tokio::spawn(handle_connection(stream, Arc::clone(&accept_state)));
             }
         });
@@ -193,6 +225,22 @@ impl MiniRelay {
         *self.state.store_delay.lock().await = delay;
     }
 
+    /// The network cut: every open connection is closed and every new one
+    /// refused, until [`MiniRelay::restore`]. The store is kept — the relay
+    /// is unreachable, not reset. A cut restored at once is a relay
+    /// restart: the connections and the subscriptions are lost, the store
+    /// is not.
+    pub async fn cut(&self) {
+        *self.state.offline.lock().await = true;
+        self.state.subscriptions.lock().await.clear();
+        self.state.cut.send_modify(|generation| *generation += 1);
+    }
+
+    /// The end of the cut: connections are accepted again.
+    pub async fn restore(&self) {
+        *self.state.offline.lock().await = false;
+    }
+
     /// Every rejection answered so far, as `(pubkey, kind, reason)`.
     pub async fn rejected(&self) -> Vec<(String, u64, String)> {
         self.state.rejected.lock().await.clone()
@@ -244,25 +292,48 @@ impl MiniRelay {
 }
 
 async fn handle_connection(stream: TcpStream, state: Arc<RelayState>) {
+    // Watched from before the handshake: a cut during it is not missed.
+    let mut cut = state.cut.subscribe();
+    let mut cut_too = state.cut.subscribe();
     let Ok(ws) = tokio_tungstenite::accept_async(stream).await else {
         return;
     };
+    if *state.offline.lock().await {
+        return;
+    }
     let (mut sink, mut source) = ws.split();
     // One writer task per connection; REQ handlers and broadcasts feed it.
+    // A cut closes the socket from here, whatever the client is doing.
     let (outbound, mut outbox) = unbounded_channel::<String>();
     tokio::spawn(async move {
-        while let Some(text) = outbox.recv().await {
-            if sink
-                .send(tokio_tungstenite::tungstenite::Message::text(text))
-                .await
-                .is_err()
-            {
-                break;
+        loop {
+            tokio::select! {
+                text = outbox.recv() => {
+                    let Some(text) = text else { break };
+                    if sink
+                        .send(tokio_tungstenite::tungstenite::Message::text(text))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                _ = cut.changed() => {
+                    let _ = sink.close().await;
+                    break;
+                }
             }
         }
     });
 
-    while let Some(Ok(message)) = source.next().await {
+    loop {
+        let message = tokio::select! {
+            message = source.next() => message,
+            _ = cut_too.changed() => break,
+        };
+        let Some(Ok(message)) = message else {
+            break;
+        };
         let Ok(text) = message.into_text() else {
             continue;
         };
@@ -309,6 +380,12 @@ async fn handle_connection(stream: TcpStream, state: Arc<RelayState>) {
             _ => {}
         }
     }
+    // The connection's subscriptions go with it.
+    state
+        .subscriptions
+        .lock()
+        .await
+        .retain(|sub| !sub.outbound.same_channel(&outbound));
 }
 
 async fn handle_publish(state: &Arc<RelayState>, event: Value, outbound: &UnboundedSender<String>) {

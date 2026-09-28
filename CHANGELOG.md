@@ -4,6 +4,28 @@ All notable changes to this project are documented in this file. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.2] — 2026-09-28
+
+### Fixed
+
+- **Nothing is signed or sent while the relay is away.** `nostr-sdk`
+  queues a message sent to a relay that is reconnecting and flushes the
+  queue once the connection is back: an event signed during a network cut
+  reached the relay seconds later, stale — rejected at best, or accepted
+  beside its re-stamped copy. The `Publisher`'s dispatcher now holds the
+  queue while the client's relay is not connected: a draft waits there for
+  a fresh stamp at the reconnection, or expires there (`Withheld(Expired)`)
+  — no signature, no mining, no token meanwhile; a loss between the choice
+  and the send puts the draft back the same way. *Away* is as the client
+  knows it: a socket closed by the peer, or a pong missed (`nostr-sdk`
+  pings every 55 s); a silent cut is seen only then.
+
+### Added
+
+- `testing::MiniRelay::cut` and `restore` — every connection closed and
+  every new one refused until the restore, the store kept: a network cut;
+  cut and restored at once, a relay restart.
+
 ## [0.1.1] — 2026-09-28
 
 ### Added
